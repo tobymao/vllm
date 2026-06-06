@@ -58,6 +58,11 @@ class DeepSeekV4ThinkingReasoningParser(DeepSeekR1ReasoningParser):
         # the rest of the stream is content and the orchestrator's
         # is_reasoning_end check must return True for every subsequent delta.
         self._implicit_end_seen: bool = False
+        # Length of the trailing partial implicit-end marker held back from the
+        # previous streaming delta (0 if none). With previous_text this lets us
+        # recover how much has already been emitted as reasoning, so a marker
+        # split across deltas is never half-emitted.
+        self._held_len: int = 0
 
     def _find_implicit_end_marker(self, text: str) -> tuple[str, int] | None:
         """Return ``(marker, index)`` of the earliest implicit end marker in
@@ -141,21 +146,40 @@ class DeepSeekV4ThinkingReasoningParser(DeepSeekR1ReasoningParser):
 
         marker_in_current = self._find_implicit_end_marker(current_text)
         if marker_in_current is None:
-            # No marker anywhere; parent's classification stands.
-            return ret
+            # No COMPLETE marker yet, but the tail of current_text may be a
+            # partial implicit-end marker split across streaming deltas
+            # (e.g. "<｜DSML｜tool" before "_calls>" arrives). Emitting that
+            # partial prefix as reasoning would corrupt the marker so the tool
+            # parser never sees its start token. Hold those trailing bytes back
+            # until a later delta resolves them. Local import reuses the
+            # canonical helper without a module-load reasoning->tool_parsers
+            # import cycle.
+            from vllm.tool_parsers.utils import partial_tag_overlap
 
-        # First sighting of the implicit end marker.
+            # Reasoning already emitted == previous_text minus the bytes held
+            # back at the end of the previous delta (delta-relative, so it does
+            # not assume earlier reasoning flowed through this method).
+            prev_emitted = len(previous_text) - self._held_len
+            overlap = max(
+                (partial_tag_overlap(current_text, m) for m in self.implicit_end_markers),
+                default=0,
+            )
+            self._held_len = overlap
+            sendable = len(current_text) - overlap
+            if sendable > prev_emitted:
+                return DeltaMessage(reasoning=current_text[prev_emitted:sendable])
+            # Everything new is a potential partial marker -- emit nothing.
+            return None
+
+        # First sighting of the COMPLETE implicit end marker. Emit reasoning
+        # between what we have already sent and the marker, then hand the whole
+        # marker (reconstructed from current_text, so a straddled marker stays
+        # intact) plus anything after it to content for the tool parser.
         self._implicit_end_seen = True
         _marker_str, marker_idx_current = marker_in_current
-        # Position within delta_text where the marker begins.
-        marker_idx_delta = marker_idx_current - len(previous_text)
-        if marker_idx_delta < 0:
-            # Marker straddles into previous_text but wasn't detected there
-            # (parent path didn't hit). Treat all of delta_text as content.
-            return DeltaMessage(content=delta_text)
-
-        reasoning_part = delta_text[:marker_idx_delta] or None
-        content_part = delta_text[marker_idx_delta:] or None
+        prev_emitted = len(previous_text) - self._held_len
+        reasoning_part = current_text[prev_emitted:marker_idx_current] or None
+        content_part = current_text[marker_idx_current:] or None
         if reasoning_part is None and content_part is None:
             return ret
         return DeltaMessage(reasoning=reasoning_part, content=content_part)

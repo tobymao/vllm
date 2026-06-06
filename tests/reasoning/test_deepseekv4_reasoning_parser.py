@@ -316,3 +316,49 @@ def test_single_end_token_delta_returns_none(parser):
         delta_token_ids=[END_TOKEN_ID],
     )
     assert out is None
+
+
+def test_implicit_end_marker_split_across_deltas(parser):
+    """Regression (vLLM #41132 / #40801): the DSML tool-call start marker can
+    arrive split across streaming deltas ("<｜DSML｜tool" then "_calls>"). The
+    partial prefix must not leak into reasoning, and the completed marker must
+    reach content whole so the tool parser sees its start token. Previously the
+    prefix was emitted as reasoning and only "_calls>" reached content, so the
+    tool call was lost and the agent loop ended with nothing to dispatch.
+    """
+    # 1. plain reasoning flows through
+    d1 = parser.extract_reasoning_streaming(
+        previous_text="",
+        current_text="thinking ",
+        delta_text="thinking ",
+        previous_token_ids=[],
+        current_token_ids=[300],
+        delta_token_ids=[300],
+    )
+    assert d1 is not None
+    assert d1.reasoning == "thinking "
+    assert d1.content is None
+
+    # 2. partial marker prefix -- held back, never emitted as reasoning
+    d2 = parser.extract_reasoning_streaming(
+        previous_text="thinking ",
+        current_text="thinking <｜DSML｜tool",
+        delta_text="<｜DSML｜tool",
+        previous_token_ids=[300],
+        current_token_ids=[300, 301],
+        delta_token_ids=[301],
+    )
+    assert "DSML" not in ((d2.reasoning if d2 else None) or "")
+
+    # 3. marker completes -- whole marker reaches content, nothing leaks
+    d3 = parser.extract_reasoning_streaming(
+        previous_text="thinking <｜DSML｜tool",
+        current_text="thinking " + DSML_MARKER,
+        delta_text="_calls>",
+        previous_token_ids=[300, 301],
+        current_token_ids=[300, 301, 302],
+        delta_token_ids=[302],
+    )
+    assert d3 is not None
+    assert (d3.reasoning or "") == ""
+    assert d3.content == DSML_MARKER
