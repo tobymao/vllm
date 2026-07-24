@@ -186,6 +186,32 @@ def _has_serialized_modelopt_fp4_nextn_experts(
         return False
 
 
+def seed_draft_packed_modules_mapping(
+    quant_config: QuantizationConfig | None,
+    config: PretrainedConfig,
+) -> None:
+    """Give the MTP draft the target model's fused-module mappings.
+
+    ``get_draft_quant_config`` returns a fresh quant config whose
+    ``packed_modules_mapping`` is empty, while the target model registers its
+    fused mappings at construction time. Without these, compressed-tensors
+    cannot match ``fused_qkv_a_proj`` against any config group and silently
+    builds it unquantized, so loading a packed checkpoint raises
+    ``KeyError: ...kv_a_proj_with_mqa.weight_packed``.
+
+    Both writes are ``setdefault``, so an existing mapping is never clobbered.
+    """
+    if quant_config is None or not hasattr(quant_config, "packed_modules_mapping"):
+        return
+    quant_config.packed_modules_mapping.setdefault(
+        "gate_up_proj", ["gate_proj", "up_proj"]
+    )
+    if getattr(config, "q_lora_rank", None) is not None:
+        quant_config.packed_modules_mapping.setdefault(
+            "fused_qkv_a_proj", ["q_a_proj", "kv_a_proj_with_mqa"]
+        )
+
+
 def _maybe_disable_unserialized_modelopt_fp4_nextn(
     config: PretrainedConfig,
     vllm_config: VllmConfig,
@@ -389,6 +415,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         quant_config = _maybe_disable_unserialized_modelopt_fp4_nextn(
             config, vllm_config, get_draft_quant_config(vllm_config)
         )
+        seed_draft_packed_modules_mapping(quant_config, config)
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
