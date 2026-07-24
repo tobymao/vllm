@@ -47,7 +47,6 @@ logger = init_logger(__name__)
 class WNA16MoEBackend(Enum):
     MARLIN = "MARLIN"
     BATCHED_MARLIN = "BATCHED_MARLIN"
-    B12X = "B12X"
     HUMMING = "HUMMING"
     CPU = "CPU"
     FLASHINFER_TRTLLM = "FLASHINFER_TRTLLM"
@@ -115,56 +114,13 @@ def _get_priority_backends() -> list[WNA16MoEBackend]:
         WNA16MoEBackend.HUMMING,
         WNA16MoEBackend.EMULATION,
     ]
-    # B12X (sparkinfer) outranks Marlin for symmetric group-N int4 on SM12x:
-    # measured 2.26x on the MoE slice at GLM-5.2's TP4 shard shapes (E=256,
-    # K=6144, N=512, top-8) on GB10. Only offered where it can actually run --
-    # `_b12x_wna16_available` degrades to False on the wrong arch or a broken
-    # sparkinfer import, so this can never make selection crash.
-    if _b12x_wna16_available():
-        _AVAILABLE_BACKENDS.insert(
-            _AVAILABLE_BACKENDS.index(WNA16MoEBackend.MARLIN),
-            WNA16MoEBackend.B12X,
-        )
     return _AVAILABLE_BACKENDS
-
-
-def _sparkinfer_wna16_importable() -> bool:
-    """True if sparkinfer's W4A16 MoE entry point can be imported."""
-    from sparkinfer.moe._shared.kernels.w4a16.kernel import (  # noqa: F401
-        run_w4a16_moe,
-    )
-
-    return True
-
-
-def _b12x_wna16_available() -> bool:
-    """Whether the B12X WNA16 MoE backend can be used on this machine.
-
-    Requires consumer-Blackwell (SM12x -- GB10/RTX50-class, where sparkinfer's
-    SM120/121 `mma.sync` kernels apply) and an importable sparkinfer. Any
-    failure -- wrong arch, missing package, broken install -- degrades to False
-    rather than propagating, so backend selection never crashes on a machine
-    that simply doesn't have it.
-    """
-    try:
-        if not current_platform.is_cuda():
-            return False
-        if not current_platform.is_device_capability_family(120):
-            return False
-        return _sparkinfer_wna16_importable()
-    except Exception:
-        logger.debug_once(
-            "B12X WNA16 MoE backend unavailable (sparkinfer not importable or "
-            "unsupported platform); falling back to the other WNA16 backends."
-        )
-        return False
 
 
 def map_wna16_backend(runner_backend: MoEBackend) -> WNA16MoEBackend:
     """Map user's MoEBackend to WNA16MoEBackend."""
     mapping = {
         "marlin": WNA16MoEBackend.MARLIN,
-        "b12x": WNA16MoEBackend.B12X,
         "humming": WNA16MoEBackend.HUMMING,
         "flashinfer_trtllm": WNA16MoEBackend.FLASHINFER_TRTLLM,
         "emulation": WNA16MoEBackend.EMULATION,
