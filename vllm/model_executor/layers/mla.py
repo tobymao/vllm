@@ -218,6 +218,16 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             topk_indices_buffer=mla_modules.topk_indices_buffer,
         )
 
+        # Tell the attention impl whether this layer refreshes the shared top-k
+        # selection or reuses the one a previous layer wrote. Set once here, not
+        # per forward: skip_topk is fixed at construction from index_topk_pattern,
+        # so the value is static per layer and safe to bake into a captured graph.
+        # The B12X BQ4 path uses it to build the query-group union only on
+        # refreshing layers and reuse it on the rest.
+        impl = getattr(self.mla_attn, "impl", None)
+        if impl is not None:
+            impl.refreshes_topk_selection = not skip_topk
+
         # The deployed NVFP4 writer accepts a scale tensor but discards it and
         # quantizes with outer scale 1.0.  Feeding x/s_l is exactly the missing
         # writer-side normalization; the CuTe readers restore s_l in-kernel.

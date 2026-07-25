@@ -80,6 +80,8 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_B12X_BQ4_PREFILL: bool = False
+    VLLM_B12X_BQ4_CAPACITY: int = 4096
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -1185,6 +1187,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS", "16")
+    ),
+    # BQ4 grouped sparse-MLA prefill: gather the UNION of 4 adjacent queries'
+    # top-k selections once instead of gathering each query's separately, and
+    # mask per query with 4 membership bits. Exact, not an approximation.
+    "VLLM_B12X_BQ4_PREFILL": lambda: (
+        os.getenv("VLLM_B12X_BQ4_PREFILL", "0").lower() in ("1", "true", "yes", "on")
+    ),
+    # Union capacity. Must exceed the union of 4 rows' top-k, which is >= topk by
+    # construction and measured ~1.35x topk on GLM-5.2; groups above capacity fall
+    # back to the scalar path.
+    "VLLM_B12X_BQ4_CAPACITY": lambda: int(
+        os.getenv("VLLM_B12X_BQ4_CAPACITY", "4096")
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")

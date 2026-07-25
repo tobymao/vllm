@@ -487,6 +487,10 @@ class B12xMLASparseBackend(AttentionBackend):
         return (num_blocks, block_size, head_size)
 
 
+# BQ4 groups four adjacent query rows under one gathered union.
+_BQ4_ROWS = 4
+
+
 @dataclass
 class B12xMLASparseMetadata(AttentionMetadata):
     """Attention metadata for the B12X_MLA_SPARSE backend."""
@@ -535,6 +539,17 @@ class B12xMLASparseMetadata(AttentionMetadata):
     block_size: int = 64
     topk_tokens: int = 2048
 
+    # BQ4 grouped-prefill workspace, owned by the builder and shared by every
+    # layer in this forward. `bq4_built` tracks whether the union in these
+    # buffers is current for the selection the layers are reading.
+    bq4_ids: torch.Tensor | None = None
+    bq4_membership: torch.Tensor | None = None
+    bq4_lengths: torch.Tensor | None = None
+    bq4_overflow: torch.Tensor | None = None
+    bq4_work_ids: torch.Tensor | None = None
+    bq4_work_membership: torch.Tensor | None = None
+    bq4_capacity: int = 0
+
 
 class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadata]):
     """Builder for B12X_MLA_SPARSE attention metadata."""
@@ -571,6 +586,65 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
         from vllm import envs as envs_mod
 
         ckv_gather_requested = envs_mod.VLLM_B12X_MLA_CKV_GATHER
+
+        # BQ4 grouped prefill workspace. It lives here rather than on the impl
+        # because every layer builds its own impl, so a per-impl buffer could not
+        # be shared -- and sharing is the whole point: GLM's index_topk_pattern
+        # means only ~1 layer in 4 refreshes the top-k selection, and the union is
+        # a pure function of that selection, so one build serves the whole
+        # refresh->reuse run. The metadata is built once per forward and handed to
+        # every layer, which is exactly the lifetime we need.
+        self.bq4_enabled = envs_mod.VLLM_B12X_BQ4_PREFILL
+        self.bq4_capacity = int(envs_mod.VLLM_B12X_BQ4_CAPACITY)
+        self.bq4_ids = None
+        self.bq4_membership = None
+        self.bq4_lengths = None
+        self.bq4_overflow = None
+        self.bq4_work_ids = None
+        self.bq4_work_membership = None
+        if self.bq4_enabled:
+            if self.bq4_capacity <= self.topk_tokens:
+                raise ValueError(
+                    f"VLLM_B12X_BQ4_CAPACITY={self.bq4_capacity} must exceed "
+                    f"index_topk={self.topk_tokens}: the union of 4 query rows is "
+                    "at least topk by construction, so a capacity at or below it "
+                    "would overflow every group back to the scalar path."
+                )
+            max_groups = max_tokens // _BQ4_ROWS
+            work_width = _BQ4_ROWS * self.topk_tokens
+            self.bq4_ids = torch.empty(
+                (max_groups, self.bq4_capacity), dtype=torch.int32, device=device
+            )
+            self.bq4_membership = torch.empty(
+                (max_groups, self.bq4_capacity), dtype=torch.uint8, device=device
+            )
+            self.bq4_lengths = torch.empty(
+                (max_groups,), dtype=torch.int32, device=device
+            )
+            self.bq4_overflow = torch.empty(
+                (max_groups,), dtype=torch.int32, device=device
+            )
+            self.bq4_work_ids = torch.empty(
+                (max_groups, work_width), dtype=torch.int32, device=device
+            )
+            self.bq4_work_membership = torch.empty(
+                (max_groups, work_width), dtype=torch.uint8, device=device
+            )
+            logger.info(
+                "B12X BQ4 grouped prefill enabled: capacity=%d topk=%d "
+                "max_groups=%d workspace=%.1f MiB",
+                self.bq4_capacity,
+                self.topk_tokens,
+                max_groups,
+                (
+                    self.bq4_ids.numel() * 4
+                    + self.bq4_membership.numel()
+                    + self.bq4_work_ids.numel() * 4
+                    + self.bq4_work_membership.numel()
+                )
+                / (1024 * 1024),
+            )
+
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.cache_seq_lens_per_token_buffer = torch.empty(
@@ -894,6 +968,13 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             dcp_ckv_gather_eligible=dcp_ckv_gather_eligible,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
+            bq4_ids=self.bq4_ids,
+            bq4_membership=self.bq4_membership,
+            bq4_lengths=self.bq4_lengths,
+            bq4_overflow=self.bq4_overflow,
+            bq4_work_ids=self.bq4_work_ids,
+            bq4_work_membership=self.bq4_work_membership,
+            bq4_capacity=self.bq4_capacity if self.bq4_enabled else 0,
         )
 
 
@@ -1052,6 +1133,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             _cdiv(self._input_num_heads, _HEAD_ALIGNMENT) * _HEAD_ALIGNMENT
         )
         self._pad_heads = self._kernel_num_heads != self._input_num_heads
+
+        # Set by MultiHeadLatentAttention at construction. Layers that reuse a
+        # previous layer's top-k selection must not rebuild the BQ4 union; the
+        # default is conservative (assume this layer refreshes) so an unpatched
+        # caller still produces correct output, just without the reuse saving.
+        self.refreshes_topk_selection: bool = True
+        self._bq4_grouped_prefill = None
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
         # The decode kernel handles independent one-token query rows. MTP
@@ -1954,6 +2042,90 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 )
             self._sync_warmup()
 
+    def _bq4_try_grouped_prefill(
+        self,
+        *,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        selected_indices: torch.Tensor,
+        attn_metadata: "B12xMLASparseMetadata",
+        num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Run the BQ4 grouped sparse-MLA prefill, or return None to fall back.
+
+        Gathers the union of each 4 adjacent query rows' top-k selections once
+        instead of gathering all four separately, and masks per query with four
+        membership bits, so the result is exact rather than approximate.
+
+        Returns None (leaving the caller on the scalar path) whenever the batch
+        does not fit the grouped form: feature off, a ragged tail that is not a
+        multiple of 4, or any group whose union exceeded the configured capacity.
+        Partial-batch mixing is deliberately not attempted here -- correctness
+        first; the tail/overflow split is a later refinement.
+        """
+        if attn_metadata.bq4_capacity <= 0 or attn_metadata.bq4_ids is None:
+            return None
+        groups, remainder = divmod(num_tokens, _BQ4_ROWS)
+        if groups == 0 or remainder:
+            return None
+        if groups > attn_metadata.bq4_ids.shape[0]:
+            return None
+
+        if self._bq4_grouped_prefill is None:
+            try:
+                from sparkinfer.attention._shared.mla.prefill import (
+                    run_glm_h8_bq4_grouped_prefill_experimental,
+                )
+                from sparkinfer.attention.nsa_indexer.query_group import (
+                    build_bq4_union,
+                )
+            except ImportError:
+                logger.warning_once(
+                    "VLLM_B12X_BQ4_PREFILL is set but this sparkinfer build has "
+                    "no BQ4 support; staying on the scalar sparse-MLA path."
+                )
+                attn_metadata.bq4_capacity = 0
+                return None
+            self._bq4_grouped_prefill = (
+                build_bq4_union,
+                run_glm_h8_bq4_grouped_prefill_experimental,
+            )
+        build_bq4_union, run_grouped = self._bq4_grouped_prefill
+
+        ids = attn_metadata.bq4_ids[:groups]
+        membership = attn_metadata.bq4_membership[:groups]
+        lengths = attn_metadata.bq4_lengths[:groups]
+        overflow = attn_metadata.bq4_overflow[:groups]
+
+        # Build only on layers that refreshed the shared selection; the rest read
+        # the identical topk_indices_buffer, so their union is already current.
+        if self.refreshes_topk_selection:
+            build_bq4_union(
+                selected_indices[:num_tokens].contiguous(),
+                out_ids=ids,
+                out_membership=membership,
+                out_lengths=lengths,
+                out_overflow=overflow,
+                work_ids=attn_metadata.bq4_work_ids[:groups],
+                work_membership=attn_metadata.bq4_work_membership[:groups],
+            )
+
+        # Any overflowing group would have a capacity-truncated union, which is
+        # not exact. Bail to the scalar path for the whole batch rather than
+        # emit a silently wrong result.
+        if bool(overflow.any().item()):
+            return None
+
+        return run_grouped(
+            q=q,
+            kv_cache=kv_cache,
+            union_indices=ids,
+            membership=membership,
+            union_lengths=lengths,
+            sm_scale=self.scale,
+            page_block_size=attn_metadata.block_size,
+        )
+
     def forward_mqa(
         self,
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
@@ -2267,6 +2439,29 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             if self._pad_heads and not use_ckv_gather:
                 prefill_q = q_buffer[:, : self._kernel_num_heads]
                 prefill_q[:, self._input_num_heads :, :].zero_()
+
+            # BQ4 grouped path, when the batch fits it. Returns None to fall
+            # through to the scalar path below on a ragged tail or any overflow.
+            # Not attempted alongside the CKV gather: that path rewrites the KV
+            # layout the grouped kernel reads, and the combination is unvalidated.
+            if attn_metadata.bq4_capacity > 0 and not use_ckv_gather:
+                bq4_result = self._bq4_try_grouped_prefill(
+                    q=prefill_q,
+                    kv_cache=kv_cache,
+                    selected_indices=selected_indices,
+                    attn_metadata=attn_metadata,
+                    num_tokens=num_actual_toks,
+                )
+                if bq4_result is not None:
+                    out, lse = bq4_result
+                    if self._pad_heads:
+                        assert dense_out_workspace is not None
+                        dense_out = dense_out_workspace[:num_actual_toks]
+                        dense_out.copy_(out[:, : self._input_num_heads, :])
+                        out = dense_out
+                        if lse is not None:
+                            lse = lse[:, : self._input_num_heads]
+                    return out, lse
 
             extend_plan = self._ckv_extend_plan if use_ckv_gather else self._extend_plan
             if extend_plan is None:
