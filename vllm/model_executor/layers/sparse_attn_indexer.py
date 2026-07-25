@@ -12,6 +12,7 @@ from vllm._aiter_ops import rocm_aiter_ops
 from vllm.config import CUDAGraphMode, get_current_vllm_config
 from vllm.distributed import get_dcp_group, get_query_split_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
@@ -53,6 +54,134 @@ _B12X_CONTIGUOUS_PREFILL512_SUPPORTED_HEADS = (32, 64)
 # MXFP4 layout: 2 values packed per byte, ue8m0 (1-byte) scale per block of 32.
 MXFP4_BLOCK_SIZE = 32
 _B12X_PREFILL_PAGED_ROUTE = "packed_contiguous"
+_OVERLAP_OFFSETS = (1, 2, 4, 8, 16)
+
+logger = init_logger(__name__)
+
+
+def _adjacent_topk_overlap_counts(
+    topk_indices: torch.Tensor,
+    token_to_seq: torch.Tensor,
+    causal_lens: torch.Tensor,
+    offsets: tuple[int, ...] = _OVERLAP_OFFSETS,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute mature-context overlap counts and BQ4 union amplification."""
+    sorted_indices = topk_indices.sort(dim=1).values
+    overlap_counts = []
+    num_rows = int(sorted_indices.shape[0])
+    for offset in offsets:
+        if num_rows <= offset:
+            overlap_counts.append(sorted_indices.new_zeros((2,), dtype=torch.int64))
+            continue
+        lhs = sorted_indices[:-offset]
+        rhs = sorted_indices[offset:]
+        same_request = token_to_seq[:-offset] == token_to_seq[offset:]
+        mature = (causal_lens[:-offset] > topk_indices.shape[1]) & (
+            causal_lens[offset:] > topk_indices.shape[1]
+        )
+        valid_pairs = same_request & mature
+        positions = torch.searchsorted(rhs, lhs)
+        positions.clamp_max_(rhs.shape[1] - 1)
+        matches = (torch.gather(rhs, 1, positions) == lhs) & (lhs >= 0)
+        intersection = (matches.sum(dim=1) * valid_pairs).sum(dtype=torch.int64)
+        denominator = (
+            torch.minimum((lhs >= 0).sum(1), (rhs >= 0).sum(1)) * valid_pairs
+        ).sum(dtype=torch.int64)
+        overlap_counts.append(torch.stack((intersection, denominator)))
+
+    if num_rows < 4:
+        union_amplifications = sorted_indices.new_empty((0,), dtype=torch.float32)
+    else:
+        starts = torch.arange(num_rows - 3, device=topk_indices.device)
+        same_request = token_to_seq[starts] == token_to_seq[starts + 3]
+        mature = causal_lens[:-3] > topk_indices.shape[1]
+        mature &= causal_lens[starts + 3] > topk_indices.shape[1]
+        valid_groups = same_request & mature
+        groups = torch.stack(
+            tuple(topk_indices[starts + i] for i in range(4)), dim=1
+        ).flatten(1)
+        groups = groups.sort(dim=1).values
+        unique = (groups[:, :1] >= 0).sum(1)
+        unique += ((groups[:, 1:] != groups[:, :-1]) & (groups[:, 1:] >= 0)).sum(1)
+        valid_set_sizes = torch.stack(
+            tuple((topk_indices[starts + i] >= 0).sum(1) for i in range(4)), dim=1
+        )
+        max_set_sizes = valid_set_sizes.max(dim=1).values
+        valid_groups &= max_set_sizes > 0
+        union_amplifications = (
+            unique[valid_groups].float() / max_set_sizes[valid_groups].float()
+        )
+    return torch.stack(overlap_counts), union_amplifications
+
+
+def _log_prefill_topk_overlap(
+    chunks: list,
+    topk_indices_buffer: torch.Tensor,
+    topk_tokens: int,
+    dcp_world_size: int,
+    layer_name: str,
+    output_physical_slots: bool,
+    use_b12x_indexer: bool,
+) -> None:
+    if output_physical_slots:
+        raise RuntimeError(
+            "Sparse-indexer overlap diagnostic requires global logical top-k ids, "
+            "but this indexer is configured to output physical cache slots."
+        )
+    if dcp_world_size > 1 and not use_b12x_indexer:
+        raise RuntimeError(
+            "Sparse-indexer overlap diagnostic cannot verify global logical ids "
+            "on the fallback DCP path because its global top-k is remapped again."
+        )
+    overlap_counts = []
+    union_amplifications = []
+    for chunk in chunks:
+        indices = topk_indices_buffer[
+            chunk.token_start : chunk.token_end, :topk_tokens
+        ]
+        causal_lens = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks) * dcp_world_size
+        overlap, amplification = _adjacent_topk_overlap_counts(
+            indices, chunk.token_to_seq, causal_lens
+        )
+        overlap_counts.append(overlap)
+        union_amplifications.append(amplification)
+    if not overlap_counts:
+        return
+    overlap = torch.stack(overlap_counts).sum(0).cpu().tolist()
+    amplifications = torch.cat(union_amplifications)
+    ratios = [
+        numerator / denominator if denominator else float("nan")
+        for numerator, denominator in overlap
+    ]
+    if amplifications.numel():
+        bq4_stats = torch.stack(
+            (
+                amplifications.mean(),
+                torch.quantile(amplifications, 0.5),
+                torch.quantile(amplifications, 0.95),
+                (amplifications <= 2.5).float().mean(),
+                amplifications.new_tensor(float(amplifications.numel())),
+            )
+        ).cpu()
+        bq4_mean, bq4_median, bq4_p95, bq4_fraction_le_2_5, bq4_groups = (
+            bq4_stats.tolist()
+        )
+    else:
+        bq4_mean = bq4_median = bq4_p95 = bq4_fraction_le_2_5 = float("nan")
+        bq4_groups = 0.0
+    logger.info(
+        "Sparse-indexer prefill overlap layer=%s offsets=%s overlap=%s "
+        "bq4_union_mean=%.6f bq4_union_median=%.6f bq4_union_p95=%.6f "
+        "bq4_fraction_le_2_5=%.6f bq4_groups=%d",
+        layer_name,
+        _OVERLAP_OFFSETS,
+        tuple(round(value, 6) for value in ratios),
+        bq4_mean,
+        bq4_median,
+        bq4_p95,
+        bq4_fraction_le_2_5,
+        int(bq4_groups),
+    )
 
 
 def _dcp_global_topk_requested() -> bool:
@@ -1836,6 +1965,17 @@ def sparse_attn_indexer(
                     cp_kv_cache_interleave_size,
                     row_starts=chunk.cu_seqlen_ks,
                 )
+
+        if envs.VLLM_SPARSE_INDEXER_OVERLAP_DIAGNOSTIC:
+            _log_prefill_topk_overlap(
+                prefill_metadata.chunks,
+                topk_indices_buffer,
+                topk_tokens,
+                dcp_world_size,
+                str(k_cache_prefix),
+                output_physical_slots,
+                use_b12x_indexer,
+            )
 
     if has_decode:
         decode_metadata = attn_metadata_narrowed.decode

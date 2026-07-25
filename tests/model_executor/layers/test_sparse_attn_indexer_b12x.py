@@ -10,6 +10,27 @@ import torch
 from vllm.model_executor.layers import sparse_attn_indexer as indexer_mod
 
 
+def test_adjacent_topk_overlap_counts_and_bq4_union() -> None:
+    indices = torch.tensor(
+        [
+            [0, 1, 2, 3],
+            [1, 2, 3, 4],
+            [2, 3, 4, 5],
+            [3, 4, 5, 6],
+        ],
+        dtype=torch.int32,
+    )
+    token_to_seq = torch.zeros(4, dtype=torch.int32)
+    causal_lens = torch.full((4,), 8, dtype=torch.int32)
+
+    overlap, amplification = indexer_mod._adjacent_topk_overlap_counts(
+        indices, token_to_seq, causal_lens, offsets=(1,)
+    )
+
+    assert overlap.tolist() == [[9, 12]]
+    torch.testing.assert_close(amplification, torch.tensor([1.75]))
+
+
 def _profile_forward_context():
     return types.SimpleNamespace(
         attn_metadata=None,

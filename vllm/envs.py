@@ -61,6 +61,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_SPARSE_INDEXER: bool = False
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
+    VLLM_GLM_FP8_DENSE: bool = False
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -1083,6 +1084,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
     ),
+    # Log adjacent-query top-k overlap and four-query union amplification for
+    # sparse-indexer prefill rows whose causal context exceeds index_topk.
+    "VLLM_SPARSE_INDEXER_OVERLAP_DIAGNOSTIC": lambda: bool(
+        int(os.getenv("VLLM_SPARSE_INDEXER_OVERLAP_DIAGNOSTIC", "0"))
+    ),
+    # Route GLM-5.2 (Int4-Int8Mix) INT8 *dense* linear projections (attention
+    # q/kv/o, fused_qkv_a, shared-expert linears) through the blockwise-FP8
+    # DeepGEMM kernel instead of Marlin w8a16. At load, eligible INT8 weights are
+    # dequantized and requantized to 128x128-block-scaled FP8 (E4M3); the int4
+    # MoE experts are untouched. Opt-in numerics change (gate goldens before use).
+    "VLLM_GLM_FP8_DENSE": lambda: bool(int(os.getenv("VLLM_GLM_FP8_DENSE", "0"))),
     # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(
