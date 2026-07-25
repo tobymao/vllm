@@ -41,6 +41,14 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             use_ue8m0=self.use_deep_gemm_e8m0,
             tma_aligned_scales=envs.VLLM_USE_DEEP_GEMM_TMA_ALIGNED_SCALES,
             column_major_scales=True,
+            # DeepGEMM consumes the activation scales in an exact layout. Under
+            # `custom_ops: ["none"]` this op is lowered by inductor instead of
+            # using its kernel, and the resulting scales are wrong -- GLM-5.2
+            # served pure token-0 with compile on and was fine with
+            # --enforce-eager. Pin the kernel for this instance only; forcing
+            # `+quant_fp8` globally instead costs 49% of prefill by displacing
+            # inductor fusion in unrelated hot paths.
+            enforce_enable=True,
         )
 
     @classmethod

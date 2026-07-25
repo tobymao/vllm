@@ -44,6 +44,7 @@ class QuantFP8(CustomOp):
         tma_aligned_scales: bool = False,
         use_ue8m0: bool | None = None,  # for Torch compile
         compile_native: bool = True,
+        enforce_enable: bool = False,
     ):
         """
         Args:
@@ -57,8 +58,19 @@ class QuantFP8(CustomOp):
             column_major_scales: For group quantization, output scales in
                 column major format
             compile_native: Manually compile forward_native if compile mode > None
+            enforce_enable: Always use the custom kernel for this instance,
+                regardless of the global `custom_ops` setting. Needed by callers
+                whose consumer requires an exact scale layout that the
+                inductor-lowered native path does not reproduce (e.g. the
+                blockwise-FP8 GEMM kernels, which ask for column-major scales).
+                Scoping it per instance avoids forcing the op model-wide, which
+                is very expensive: enabling `+quant_fp8` globally measured a 49%
+                prefill regression on GLM-5.2 by displacing inductor fusion in
+                unrelated hot paths.
         """
-        super().__init__(compile_native=compile_native)
+        super().__init__(
+            compile_native=compile_native, enforce_enable=enforce_enable
+        )
         self.static = static
         self.group_shape = group_shape
         self.use_per_token_if_dynamic = group_shape == GroupShape.PER_TOKEN
