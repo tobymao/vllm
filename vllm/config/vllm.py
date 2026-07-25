@@ -2179,6 +2179,7 @@ class VllmConfig:
         if (
             self.compilation_config.pass_config.enable_sp
             and self.parallel_config.tensor_parallel_size > 1
+            and not envs.VLLM_V2_ALLOW_SEQUENCE_PARALLELISM
         ):
             unsupported.append("sequence parallelism")
 

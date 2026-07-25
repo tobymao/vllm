@@ -80,6 +80,7 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
+    VLLM_V2_ALLOW_SEQUENCE_PARALLELISM: bool = False
     VLLM_B12X_BQ4_PREFILL: bool = False
     VLLM_B12X_BQ4_CAPACITY: int = 4096
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
@@ -1191,6 +1192,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # BQ4 grouped sparse-MLA prefill: gather the UNION of 4 adjacent queries'
     # top-k selections once instead of gathering each query's separately, and
     # mask per query with 4 membership bits. Exact, not an approximation.
+    # Escape hatch for the Model Runner V2 sequence-parallelism block. SP is
+    # implemented purely as a torch.compile pass (SequenceParallelismPass) with no
+    # runner-side support, and V2's unsupported list was built conservatively as an
+    # allowlist, so the block may simply be untested rather than incompatible.
+    # Opt in to find out; leave off unless you are measuring.
+    "VLLM_V2_ALLOW_SEQUENCE_PARALLELISM": lambda: (
+        os.getenv("VLLM_V2_ALLOW_SEQUENCE_PARALLELISM", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
     "VLLM_B12X_BQ4_PREFILL": lambda: (
         os.getenv("VLLM_B12X_BQ4_PREFILL", "0").lower() in ("1", "true", "yes", "on")
     ),
