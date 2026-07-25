@@ -90,13 +90,19 @@ def _extract_data_from_linear_base_module(
     LinearBase module.
     """
     assert isinstance(m, LinearBase)
-    assert isinstance(m.quant_method, Fp8LinearMethod)
-    assert m.quant_method.block_quant
-    assert m.quant_method.quant_config is not None
+
+    if isinstance(m.quant_method, Fp8LinearMethod):
+        assert m.quant_method.block_quant
+        assert m.quant_method.quant_config is not None
+        quant_block_size = m.quant_method.quant_config.weight_block_size
+    else:
+        # A layer from another quant method that was routed to the blockwise-FP8
+        # kernel anyway (e.g. compressed-tensors INT8 requantized at load). Such
+        # a layer records its block size on itself.
+        quant_block_size = getattr(m, "weight_block_size", None)
 
     w = m.weight
     ws = m.weight_scale_inv if hasattr(m, "weight_scale_inv") else m.weight_scale
-    quant_block_size = m.quant_method.quant_config.weight_block_size
 
     assert isinstance(w, torch.Tensor)
     assert isinstance(ws, torch.Tensor)
@@ -141,19 +147,32 @@ def _fp8_linear_may_use_deep_gemm(module: torch.nn.Module) -> bool:
     if getattr(module, "b12x_skip_generic_block_fp8_linear", False):
         return False
 
-    if not (
-        isinstance(module, LinearBase)
-        and isinstance(module.quant_method, Fp8LinearMethod)
-        and not isinstance(module.quant_method, Mxfp8OnlineLinearMethod)
-        and getattr(module.quant_method, "block_quant", False)
-        and not getattr(module.quant_method, "use_marlin", True)
-    ):
+    if not isinstance(module, LinearBase):
         return False
 
-    if not isinstance(
-        getattr(module.quant_method, "fp8_linear", None),
-        DeepGemmFp8BlockScaledMMKernel,
-    ):
+    # A layer reaches DeepGEMM either through Fp8LinearMethod, or because some
+    # other quant method routed it to the blockwise-FP8 kernel at load time
+    # (e.g. compressed-tensors INT8 requantized to 128x128-block FP8). The
+    # second kind used to be invisible here, so its kernels were never JIT-built
+    # during warmup and instead compiled on first use -- inside CUDA graph
+    # capture, which silently produces garbage. Match on the kernel actually
+    # installed rather than on the quant method's class.
+    kernel = getattr(module.quant_method, "fp8_linear", None)
+    if kernel is None:
+        # compressed-tensors stores the per-layer scheme on the layer itself.
+        kernel = getattr(getattr(module, "scheme", None), "fp8_dense_kernel", None)
+
+    if not isinstance(kernel, DeepGemmFp8BlockScaledMMKernel):
+        return False
+
+    if isinstance(module.quant_method, Fp8LinearMethod):
+        if (
+            isinstance(module.quant_method, Mxfp8OnlineLinearMethod)
+            or not getattr(module.quant_method, "block_quant", False)
+            or getattr(module.quant_method, "use_marlin", True)
+        ):
+            return False
+    elif getattr(module, "weight_block_size", None) is None:
         return False
 
     block_size = get_mk_alignment_for_contiguous_layout()[0]
