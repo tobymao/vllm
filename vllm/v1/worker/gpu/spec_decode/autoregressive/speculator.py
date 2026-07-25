@@ -55,6 +55,41 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.prefill_cudagraph_manager: SpeculatorCudaGraphManager | None = None
         self.decode_cudagraph_manager: SpeculatorCudaGraphManager | None = None
 
+        # index_share_for_mtp_iteration: the draft's sparse attention computes its
+        # own top-k indices on draft step 0, and steps 1+ reuse them instead of
+        # re-running the indexer. `llm_base_proposer` already honours this; this
+        # proposer did not, so every draft step paid for a full index selection.
+        self._share_mtp_indices = getattr(
+            self.draft_model_config.hf_config, "index_share_for_mtp_iteration", False
+        )
+
+    def _set_skip_topk(self, skip: bool) -> None:
+        """Pin draft index reuse for the next draft pass.
+
+        `skip_topk` is read while tracing, so a captured graph bakes in whichever
+        value was set at capture time. Both call sites (capture and replay) must
+        therefore agree per graph family: draft prefill always False, draft
+        decode always True.
+        """
+        if not self._share_mtp_indices:
+            return
+        model = getattr(self.model, "model", None)
+        if model is not None and hasattr(model, "set_skip_topk"):
+            model.set_skip_topk(skip)
+
+    def _compact_draft_topk_indices(self, num_reqs: int) -> None:
+        """Move step 0's per-request index rows to the front of the shared buffer.
+
+        Draft prefill selects indices for every query token in the verifier batch;
+        steps 1+ run one token per request, so the rows they read must first be
+        gathered from each request's last token.
+        """
+        if not self._share_mtp_indices:
+            return
+        model = getattr(self.model, "model", None)
+        if model is not None and hasattr(model, "compact_topk_indices"):
+            model.compact_topk_indices(self.last_token_indices[:num_reqs])
+
     @property
     def advance_draft_positions(self) -> bool:
         """
@@ -105,6 +140,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         assert self.prefill_cudagraph_manager is not None
         if self.prefill_cudagraph_manager.use_breakable_cg:
             self.prefill_cudagraph_manager.init_breakable_cg_runner(self.model)
+        self._set_skip_topk(False)
         self.prefill_cudagraph_manager.capture(
             self._prefill,
             self.model_state,
@@ -122,6 +158,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # sample + update_draft_inputs) for a single
         # step.
         assert self.decode_cudagraph_manager is not None
+        self._set_skip_topk(True)
         self.decode_cudagraph_manager.capture(
             self._generate_draft,
             self.model_state,
@@ -282,6 +319,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self._prepare_eplb_forward(input_batch.num_tokens)
 
+        # Draft step 0 selects the indices that steps 1+ will reuse.
+        self._set_skip_topk(False)
+
         if prefill_batch_desc.cg_mode == CUDAGraphMode.FULL:
             if rebuild_prefill_attn_metadata:
                 rebuild_draft_prefill_attn_state()
@@ -318,6 +358,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         if num_speculative_tokens == 1:
             # Early exit.
             return self.draft_tokens[:num_reqs, :1]
+
+        # Steps 1+ reuse step 0's indices, gathered to each request's last token.
+        self._compact_draft_topk_indices(num_reqs)
+        self._set_skip_topk(True)
 
         # Prepare the inputs for the decode steps.
         with record_function_or_nullcontext("vllm:v2/speculator/decode/prepare"):
