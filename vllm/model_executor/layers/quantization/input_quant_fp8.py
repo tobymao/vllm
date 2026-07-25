@@ -202,6 +202,15 @@ class QuantFP8(CustomOp):
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
+            # Mirror the forward_cuda branch: when the oracle selects DeepGEMM's
+            # packed UE8M0 scale format, plain float32 scales are the wrong
+            # format entirely, not merely a different layout. Without this the
+            # compiled path silently feeds DeepGEMM unpacked scales -- GLM-5.2
+            # served pure token-0 with compile on and was correct under
+            # --enforce-eager. Producing the packed form here (rather than
+            # forcing the custom op) keeps the quantization fusable by inductor.
+            if self._use_deepgemm_packed_scales():
+                return self._quantize_group_native_packed(x)
             return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
@@ -241,6 +250,71 @@ class QuantFP8(CustomOp):
             out = F.pad(out, (0, 0, 0, padding), "constant", 0.0)
 
         return out, scale
+
+    def _use_deepgemm_packed_scales(self) -> bool:
+        """Whether the consumer expects DeepGEMM's packed UE8M0 scale format."""
+        from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+
+        if not (self.use_deep_gemm_supported and self.use_ue8m0):
+            return False
+        try:
+            return DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
+        except AssertionError:
+            # Oracle not initialized (e.g. standalone use); fall back to plain
+            # scales rather than guessing at the packed layout.
+            return False
+
+    def _quantize_group_native_packed(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Native equivalent of per_token_group_quant_fp8_packed_for_deepgemm.
+
+        Verified bit-identical to the C++ op (values, shape and TMA-aligned
+        stride) across square, wide and ragged-row shapes. Expressed in plain
+        torch ops so inductor can fuse it with neighbouring work, which a custom
+        op cannot be.
+        """
+        hidden_dim = x.shape[-1]
+        assert hidden_dim % self.group_size == 0, (
+            f"hidden dim {hidden_dim} must be divisible by group {self.group_size}"
+        )
+        mn = x.numel() // hidden_dim
+        num_groups = hidden_dim // self.group_size
+        k_packed = (num_groups + 3) // 4
+        tma_aligned_mn = ((mn + 3) // 4) * 4
+
+        xg = x.reshape(mn, num_groups, self.group_size).float()
+        absmax = xg.abs().amax(dim=-1).clamp(min=_FP8_MIN_SCALING_FACTOR)
+
+        # UE8M0 keeps only a power-of-two scale, so the exponent is the payload.
+        exponent = torch.ceil(torch.log2(absmax / _FP8_MAX))
+        quantized = (xg / torch.exp2(exponent).unsqueeze(-1)).clamp(
+            _FP8_MIN, _FP8_MAX
+        )
+        x_q = quantized.to(_FP8_DTYPE).reshape(x.shape)
+
+        # e8m0 byte is the biased exponent; four bytes pack into one int32.
+        byte = (exponent + 127.0).clamp(0, 255).to(torch.int32)
+        pad = k_packed * 4 - num_groups
+        if pad:
+            byte = F.pad(byte, (0, pad))
+        b = byte.reshape(mn, k_packed, 4)
+        packed = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16) | (b[..., 3] << 24)
+
+        # DeepGEMM asserts sf.stride(-2) == 1, i.e. the mn dim must be the fast
+        # one, with the slow stride padded to align4(mn). Build that by making a
+        # [k_packed, align4(mn)] contiguous tensor and transposing, rather than
+        # via empty_strided+copy_: inductor is free to ignore an empty_strided
+        # layout request and materialize row-major (which trips the assertion),
+        # but it does preserve a transpose-derived view. Slicing the leading dim
+        # afterwards keeps the strides intact.
+        # Pad unconditionally: `mn` is symbolic under dynamic shapes, so a
+        # `if tma_aligned_mn != mn` guard specializes the graph on whichever
+        # branch is traced first and then produces the wrong stride for other
+        # token counts. F.pad by 0 is a no-op that keeps this shape-polymorphic.
+        packed_t = F.pad(packed.transpose(0, 1), (0, tma_aligned_mn - mn))
+        packed_t = packed_t.contiguous()
+        return x_q, packed_t.transpose(0, 1)[:mn]
 
     def _quantize_group_native(
         self, x: torch.Tensor
