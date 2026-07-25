@@ -210,7 +210,19 @@ class QuantFP8(CustomOp):
             # --enforce-eager. Producing the packed form here (rather than
             # forcing the custom op) keeps the quantization fusable by inductor.
             if self._use_deepgemm_packed_scales():
-                return self._quantize_group_native_packed(x)
+                # DeepGEMM *always* expects packed UE8M0 scales here, so there is
+                # no falling back to `_quantize_group_native` -- its float32
+                # scales have a different shape and stride entirely and trip the
+                # kernel's layout assertions. Only the tail-alignment case
+                # defers, and it defers to the CUDA packed op, which produces the
+                # same format.
+                if (x.numel() // x.shape[-1]) % 4 == 0:
+                    return self._quantize_group_native_packed(x)
+                from vllm.model_executor.layers.quantization.utils import fp8_utils
+
+                return fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
+                    x, group_size=self.group_size, use_ue8m0=True
+                )
             return self._quantize_group_native(x)
 
         assert (scale is not None) == self.static
@@ -281,7 +293,6 @@ class QuantFP8(CustomOp):
         mn = x.numel() // hidden_dim
         num_groups = hidden_dim // self.group_size
         k_packed = (num_groups + 3) // 4
-        tma_aligned_mn = ((mn + 3) // 4) * 4
 
         xg = x.reshape(mn, num_groups, self.group_size).float()
         absmax = xg.abs().amax(dim=-1).clamp(min=_FP8_MIN_SCALING_FACTOR)
@@ -308,13 +319,15 @@ class QuantFP8(CustomOp):
         # layout request and materialize row-major (which trips the assertion),
         # but it does preserve a transpose-derived view. Slicing the leading dim
         # afterwards keeps the strides intact.
-        # Pad unconditionally: `mn` is symbolic under dynamic shapes, so a
-        # `if tma_aligned_mn != mn` guard specializes the graph on whichever
-        # branch is traced first and then produces the wrong stride for other
-        # token counts. F.pad by 0 is a no-op that keeps this shape-polymorphic.
-        packed_t = F.pad(packed.transpose(0, 1), (0, tma_aligned_mn - mn))
-        packed_t = packed_t.contiguous()
-        return x_q, packed_t.transpose(0, 1)[:mn]
+        # Required layout: size(-2) == mn, stride(-2) == 1, stride(-1) ==
+        # get_tma_aligned_size(mn). Callers reaching this path have mn % 4 == 0
+        # (see _use_deepgemm_packed_scales), so the aligned size IS mn and a
+        # plain transpose-of-contiguous gives all three exactly -- no pad, no
+        # slice. That matters: pad/slice on a symbolic mn does not survive
+        # inductor's dynamic shapes, and torch.empty_strided does not survive it
+        # either (it materializes row-major and breaks stride(-2) == 1).
+        packed_t = packed.transpose(0, 1).contiguous()
+        return x_q, packed_t.transpose(0, 1)
 
     def _quantize_group_native(
         self, x: torch.Tensor
