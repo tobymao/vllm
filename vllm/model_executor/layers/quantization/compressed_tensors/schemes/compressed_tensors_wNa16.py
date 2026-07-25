@@ -290,6 +290,22 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         weight_shape = (output_size_per_partition, input_size_per_partition)
         if not should_use_deepgemm_for_fp8_linear(torch.bfloat16, weight_shape):
             return None
+        # `should_use_deepgemm_for_fp8_linear` only demands N % 64 == 0, but the
+        # 128x128 weight blocks mean the selected block-scaled kernel needs whole
+        # 128-row blocks. On SM121 the chosen kernel is CutlassFp8BlockScaledMM,
+        # which hard-fails in cutlass_gemm_caller for a ragged final row block:
+        # measured OK at N=2560/2688/4096, RuntimeError at N=2624. GLM's fused
+        # q_a+kv_a projection is exactly N=2624, so without this it converts a
+        # layer the kernel cannot execute. Leave those on Marlin.
+        if output_size_per_partition % 128 != 0:
+            logger.info_once(
+                "GLM fp8-dense: skipping %s (N=%d is not a multiple of the 128-row "
+                "block scale granularity); keeping Marlin for this layer.",
+                self.layer_name,
+                output_size_per_partition,
+                scope="global",
+            )
+            return None
 
         kernel = init_fp8_linear_kernel(
             activation_quant_key=create_fp8_quant_key(

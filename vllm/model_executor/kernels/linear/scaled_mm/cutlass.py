@@ -307,6 +307,20 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
                 "Supports only dynamic per token group activation "
                 "quantization with group_shape=(1,128).",
             )
+
+        # The blockwise weight scales tile N by the weight group's row extent, and
+        # cutlass_gemm_caller aborts on a partial trailing row block. Decline such
+        # shapes here so the selector can fall through to a kernel that handles
+        # them, instead of failing at inference time.
+        weight_group_shape = config.weight_quant_key.scale.group_shape
+        block_n = weight_group_shape.row
+        n = config.weight_shape[0]
+        if block_n > 1 and n % block_n != 0:
+            return (
+                False,
+                f"Weight N={n} is not a multiple of the {block_n}-row block "
+                "scale granularity.",
+            )
         return True, None
 
     def apply_block_scaled_mm(
