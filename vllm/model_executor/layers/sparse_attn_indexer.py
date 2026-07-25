@@ -114,6 +114,16 @@ def _adjacent_topk_overlap_counts(
     return torch.stack(overlap_counts), union_amplifications
 
 
+def _prefill_query_to_seq(chunk, causal_lens: torch.Tensor) -> torch.Tensor:
+    """Return request ids for prefill query rows, not KV-context positions."""
+    if chunk.num_reqs != 1:
+        raise RuntimeError(
+            "Sparse-indexer overlap diagnostic requires single-request prefill "
+            "chunks so query rows can be mapped to their request exactly."
+        )
+    return torch.zeros_like(causal_lens)
+
+
 def _log_prefill_topk_overlap(
     chunks: list,
     topk_indices_buffer: torch.Tensor,
@@ -140,8 +150,9 @@ def _log_prefill_topk_overlap(
             chunk.token_start : chunk.token_end, :topk_tokens
         ]
         causal_lens = (chunk.cu_seqlen_ke - chunk.cu_seqlen_ks) * dcp_world_size
+        query_to_seq = _prefill_query_to_seq(chunk, causal_lens)
         overlap, amplification = _adjacent_topk_overlap_counts(
-            indices, chunk.token_to_seq, causal_lens
+            indices, query_to_seq, causal_lens
         )
         overlap_counts.append(overlap)
         union_amplifications.append(amplification)

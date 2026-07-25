@@ -31,6 +31,30 @@ def test_adjacent_topk_overlap_counts_and_bq4_union() -> None:
     torch.testing.assert_close(amplification, torch.tensor([1.75]))
 
 
+def test_prefill_query_to_seq_uses_query_row_count() -> None:
+    # token_to_seq describes KV-context positions and is intentionally longer
+    # than the query-row metadata under chunked prefill.
+    chunk = types.SimpleNamespace(
+        num_reqs=1,
+        token_to_seq=torch.zeros(12, dtype=torch.int32),
+    )
+    causal_lens = torch.arange(4, dtype=torch.int32)
+
+    query_to_seq = indexer_mod._prefill_query_to_seq(chunk, causal_lens)
+
+    assert query_to_seq.shape == causal_lens.shape
+    assert query_to_seq.tolist() == [0, 0, 0, 0]
+
+
+def test_prefill_query_to_seq_rejects_ambiguous_multi_request_chunk() -> None:
+    chunk = types.SimpleNamespace(num_reqs=2)
+
+    with pytest.raises(RuntimeError, match="single-request prefill chunks"):
+        indexer_mod._prefill_query_to_seq(
+            chunk, torch.arange(4, dtype=torch.int32)
+        )
+
+
 def _profile_forward_context():
     return types.SimpleNamespace(
         attn_metadata=None,
