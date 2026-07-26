@@ -508,6 +508,9 @@ class B12xMLASparseMetadata(AttentionMetadata):
     num_decodes: int
     num_prefills: int
     prefill_max_seq_len: int
+    # True only for a multi-token speculative-verification batch. Unlike a
+    # short chunked prefill, every request has completed its prompt.
+    is_spec_decode: bool
 
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
@@ -580,6 +583,10 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
             self.dcp_rank = get_dcp_group().rank_in_group
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
+        spec_config = getattr(vllm_config, "speculative_config", None)
+        self.num_speculative_tokens = int(
+            getattr(spec_config, "num_speculative_tokens", 0) or 0
+        )
 
         max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         max_seqs = vllm_config.scheduler_config.max_num_seqs
@@ -729,6 +736,14 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 )
             )
         assert num_decode_tokens + num_prefill_tokens == num_tokens
+
+        is_spec_decode = False
+        if (
+            self.num_speculative_tokens > 0
+            and 1 < cm.max_query_len <= self.num_speculative_tokens + 1
+            and cm.is_prefilling is not None
+        ):
+            is_spec_decode = not bool(torch.any(cm.is_prefilling[: cm.num_reqs]))
 
         use_dcp = self.dcp_world_size > 1
         seq_lens_for_req = (
@@ -928,6 +943,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             num_decodes=num_decodes,
             num_prefills=num_prefills,
             prefill_max_seq_len=cm.max_seq_len if num_prefills > 0 else 0,
+            is_spec_decode=is_spec_decode,
             query_start_loc=cm.query_start_loc,
             slot_mapping=cm.slot_mapping,
             block_table=cm.block_table_tensor,
@@ -990,6 +1006,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     supports_dcp_gather_query_in_workspace: bool = True
     supports_dcp_project_before_merge_in_workspace: bool = True
     supports_dcp_reduce_scatter_output_in_workspace: bool = True
+    # Cross-layer CKV prefetch state must exist before the first backend
+    # instance so profile-cache cleanup is independent of construction order.
+    _all_layer_kv_caches: list[torch.Tensor | None] = []
+    _shared_gather_event: torch.cuda.Event | None = None
+    _shared_gather_buf_idx: int = 0
 
     def __init__(
         self,
@@ -1057,6 +1078,10 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self.v_head_dim: int = mla_args.get("v_head_dim", 512)
         # GLM_NSA contract: q_head_dim = kv_lora_rank (512) + qk_rope (64) = 576.
         self.q_head_dim = self.kv_lora_rank + self.qk_rope_head_dim
+        # Query absorption sees a head-major, non-contiguous Q view. Some
+        # cuBLAS BF16 BMM kernels read past tight custom allocations, so route
+        # this BMM through the safe query op instead of materializing Q.
+        self.use_safe_mla_query_bmm = True
         # The indexer carries the shared buffer for normal layers and tests;
         # the explicitly-passed buffer covers backbone skip layers, whose
         # indexer is not constructed (see deepseek_v2.py).
@@ -1142,20 +1167,33 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._bq4_grouped_prefill = None
 
         self.spec_decode_max_q = _env_int("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", 8)
-        # The decode kernel handles independent one-token query rows. MTP
-        # verification has multiple query rows per request, and later rows must
-        # attend to earlier draft rows in the same verifier batch. Route those
-        # batches through the extend path unless explicitly overridden.
-        self.spec_extend_as_decode = (
-            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "0") != "0"
+        spec_decode_mode = (
+            os.getenv("VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto").strip().lower()
         )
+        disabled_modes = {"0", "false", "off", "no"}
+        forced_modes = {"1", "true", "on", "yes"}
+        if spec_decode_mode not in {"auto", *disabled_modes, *forced_modes}:
+            raise ValueError(
+                "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE must be auto, 0, or 1 "
+                f"(got {spec_decode_mode!r})"
+            )
+        self.spec_extend_as_decode = spec_decode_mode not in disabled_modes
+        self.spec_extend_as_decode_force = spec_decode_mode in forced_modes
 
         # Decode query rows per request (1, plus speculative draft tokens).
         q_per_req = 1
         spec = getattr(vllm_config, "speculative_config", None)
-        if spec is not None and getattr(spec, "num_speculative_tokens", None):
+        if (
+            self.spec_extend_as_decode
+            and spec is not None
+            and getattr(spec, "num_speculative_tokens", None)
+        ):
             q_per_req = 1 + int(spec.num_speculative_tokens)
-        if self.spec_extend_as_decode:
+        # Auto mode only dispatches genuine verifier batches, whose maximum
+        # row count is fixed by speculative_config. The explicit force mode
+        # may also route arbitrary short extends and therefore reserves the
+        # full operator limit.
+        if self.spec_extend_as_decode_force:
             q_per_req = max(q_per_req, self.spec_decode_max_q)
         self._decode_max_rows = min(max_num_seqs * q_per_req, max_batched)
         if self._decode_max_rows < max_num_seqs:
@@ -1350,6 +1388,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         # Q arrives BF16; the unified kernel quantizes inside.
         self.supports_quant_query_input = False
 
+    @classmethod
+    def reset_kv_cache_binding_state(cls) -> None:
+        """Drop prefetch state whose pointers belong to an old KV cache.
+
+        Layer prefetch learns each layer's cache tensor during forward and
+        deliberately keeps those tensors across ordinary scheduler steps.
+        They are not valid across a KV-cache replacement, however. In
+        particular, MRV2 CUDA-graph memory profiling binds a temporary cache,
+        destroys it, and later binds the production cache without rebuilding
+        the attention implementations.
+
+        The runner calls this hook while tearing down the temporary cache.
+        The first forward on the new cache therefore primes the registry with
+        synchronous gathers; later forwards recover normal layer prefetch.
+        """
+        cls._all_layer_kv_caches = []
+        cls._shared_gather_event = None
+        cls._shared_gather_buf_idx = 0
+
     def do_kv_cache_update(
         self,
         kv_c_normed: torch.Tensor,
@@ -1448,6 +1505,45 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         ):
             raise RuntimeError("B12X DCP prefill borrowed an invalid raw scratch")
         return q_workspace, dense_out_workspace, scratch_storage
+
+    def supports_fused_mla_query_output(
+        self,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> bool:
+        """Whether fused query assembly can target the planned B12X layout."""
+        return bool(
+            self.dcp_world_size == 1
+            and output_dtype == torch.bfloat16
+            and num_heads == self._input_num_heads
+            and self._kernel_num_heads == self._input_num_heads
+            and self.q_head_dim == 576
+        )
+
+    def get_fused_mla_query_output(
+        self,
+        num_tokens: int,
+        num_heads: int,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor | None:
+        """Return the final B12X query view for fused DCP1 assembly.
+
+        DCP query gathering needs a different local-head layout, so those
+        configurations retain the ordinary temporary query path. For DCP1,
+        writing the fused epilogue directly here lets ``forward_mqa`` consume
+        the query without a concat or workspace copy.
+        """
+        if (
+            not self.supports_fused_mla_query_output(num_heads, output_dtype)
+            or num_tokens <= 0
+            or num_tokens > self._max_batched
+        ):
+            return None
+        q_workspace, _, _ = self._borrow_workspace_parts()
+        output = q_workspace[:num_tokens, :num_heads]
+        if not output.is_contiguous():
+            raise RuntimeError("B12X fused MLA query output must be contiguous")
+        return output
 
     def _validate_dcp_prefill_workspace_contract(self, num_tokens: int) -> None:
         supported_topologies = {
@@ -1595,13 +1691,13 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
-        # Virtual-TP head padding writes into a head-major workspace sized for
-        # the configured token capacity. A shorter final prefill chunk is a
-        # pitched, non-contiguous view of that allocation, but it is safe here:
-        # the projection input is compacted below before entering cuBLAS.
+        # SparkInfer's head-major extend output is planned for the configured
+        # token capacity, even when the gathered head count needs no padding.
+        # A shorter prefill chunk is therefore a pitched view of that allocation.
+        # It is safe here because the input is compacted before entering cuBLAS.
         expected_attn_stride = (
             self.kv_lora_rank,
-            (self._max_batched if self._pad_heads else num_tokens) * self.kv_lora_rank,
+            self._max_batched * self.kv_lora_rank,
             1,
         )
         if (
@@ -2361,8 +2457,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
                 B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
 
+        use_spec_decode_kernel = self.spec_extend_as_decode and (
+            self.spec_extend_as_decode_force or attn_metadata.is_spec_decode
+        )
         use_decode_kernel = attn_metadata.max_query_len <= 1 or (
-            self.spec_extend_as_decode
+            use_spec_decode_kernel
             and attn_metadata.max_query_len <= self.spec_decode_max_q
             and num_actual_toks <= attn_metadata.num_reqs * self.spec_decode_max_q
             and num_actual_toks <= self._decode_max_rows

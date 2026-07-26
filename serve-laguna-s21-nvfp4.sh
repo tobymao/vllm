@@ -37,16 +37,22 @@ export VLLM_USE_B12X_MOE="${VLLM_USE_B12X_MOE:-1}"
 export VLLM_ENABLE_PCIE_ALLREDUCE="${VLLM_ENABLE_PCIE_ALLREDUCE:-1}"
 export VLLM_PCIE_ALLREDUCE_BACKEND="${VLLM_PCIE_ALLREDUCE_BACKEND:-b12x}"
 export VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE="${VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE:-64KB}"
+export B12X_MOE_FORCE_A8="${B12X_MOE_FORCE_A8:-0}"
+export B12X_MOE_FORCE_A16="${B12X_MOE_FORCE_A16:-0}"
 
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 export NCCL_PROTO="${NCCL_PROTO:-LL,LL128,Simple}"
 
 MODEL_PATH="${MODEL_PATH:-poolside/Laguna-S-2.1-NVFP4}"
-MODEL_REVISION="${MODEL_REVISION_OVERRIDE:-216d1f13878dd4e715bc7412848d0f330e95bba6}"
+MODEL_REVISION="${MODEL_REVISION_OVERRIDE:-RC1}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-laguna-s-2.1}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-FLASHINFER}"
+DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND:-FLASHINFER}"
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
+LINEAR_BACKEND="${LINEAR_BACKEND:-b12x}"
 TP_SIZE="${TP_SIZE:-2}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.90}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
@@ -66,9 +72,10 @@ exec "${PYTHON_BIN}" -m vllm.entrypoints.cli.main serve \
   --kv-cache-dtype fp8 \
   --block-size 128 \
   --load-format "${LOAD_FORMAT}" \
-  --attention-backend B12X_ATTN \
-  --moe-backend b12x \
-  --linear-backend b12x \
+  --attention-backend "${ATTENTION_BACKEND}" \
+  --moe-backend "${MOE_BACKEND}" \
+  --linear-backend "${LINEAR_BACKEND}" \
+  --speculative-config "{\"model\":\"poolside/Laguna-S-2.1-DFlash-NVFP4\",\"num_speculative_tokens\":7,\"method\":\"dflash\",\"attention_backend\":\"${DRAFT_ATTENTION_BACKEND}\"}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \

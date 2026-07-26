@@ -36,6 +36,14 @@ from vllm.v1.worker.cp_utils import get_total_cp_world_size
 logger = init_logger(__name__)
 
 
+def _align_block_table_width(num_blocks: int, block_size: int) -> int:
+    """Match the model runner's backend-facing block-table row alignment."""
+    if block_size > 128:
+        return num_blocks
+    alignment = 128 // block_size
+    return cdiv(num_blocks, alignment) * alignment
+
+
 @triton.jit
 def _prepare_uniform_decode_kernel(
     seq_lens_ptr,
@@ -451,6 +459,17 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             self.vllm_config.model_config.max_model_len,
             self.kv_cache_spec.block_size * get_total_cp_world_size(),
         )
+        # Keep the expanded decode table layout identical to the model
+        # runner's block table. The runner right-pads rows to a 128-token
+        # boundary for attention backends; sizing this buffer to only the
+        # logical page count can therefore produce a different row stride
+        # (for example 1875 here versus 1876 in the runner at 480k,
+        # block_size=64, DCP=4). Besides breaking variable-width MTP's
+        # repeat_interleave, that divergent stride is passed to the paged
+        # indexer kernels during flattened decode.
+        max_num_blocks_per_req = _align_block_table_width(
+            max_num_blocks_per_req, self.kv_cache_spec.block_size
+        )
         self.expanded_block_table_buffer = torch.zeros(
             (
                 scheduler_config.max_num_batched_tokens,
@@ -592,6 +611,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         min_decode_len = int(decode_lens_cpu.min().item())
         if not use_native and (max_decode_len > 1 or force_flatten):
             assert self.decode_seq_lens_buffer.dim() == 1
+            if block_table.shape[1] != self.expanded_block_table_buffer.shape[1]:
+                raise ValueError(
+                    "MTP block-table row width does not match its expanded buffer: "
+                    f"{block_table.shape[1]} != "
+                    f"{self.expanded_block_table_buffer.shape[1]}"
+                )
             if (
                 min_decode_len == max_decode_len
                 and num_decodes * max_decode_len == num_decode_tokens
