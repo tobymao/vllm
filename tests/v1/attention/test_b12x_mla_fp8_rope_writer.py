@@ -55,7 +55,7 @@ def _construct_through_writer_binding(
     enabled: bool,
 ) -> B12xMLASparseImpl:
     monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", enabled)
-    monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
+    monkeypatch.setattr(b12x_mla_sparse, "IS_GLM_MOE_DSA_CACHE", True)
 
     def stop_after_writer_binding():
         raise _StopAfterWriterBinding
@@ -284,7 +284,7 @@ def test_enabled_mode_missing_public_writer_fails_closed(
 ):
     _install_fake_writer_package(monkeypatch, writer=None)
     monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", True)
-    monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
+    monkeypatch.setattr(b12x_mla_sparse, "IS_GLM_MOE_DSA_CACHE", True)
 
     def reject_fallback_initialization():
         raise _StopAfterWriterBinding
@@ -317,7 +317,7 @@ def test_enabled_mode_writer_initialization_failure_fails_closed(
 
     monkeypatch.setattr("builtins.__import__", fail_writer_initialization)
     monkeypatch.setattr(b12x_mla_sparse, "_KV_FP8_ROPE_REQUESTED", True)
-    monkeypatch.setattr(b12x_mla_sparse, "_IS_GLM_MOE_DSA_CACHE", True)
+    monkeypatch.setattr(b12x_mla_sparse, "IS_GLM_MOE_DSA_CACHE", True)
 
     def reject_fallback_initialization():
         raise _StopAfterWriterBinding

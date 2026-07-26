@@ -81,7 +81,7 @@ _CKV_GATHER_WORKSPACES: dict[tuple[str, int | None], torch.Tensor] = {}
 _KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
-_IS_GLM_MOE_DSA_CACHE: bool | None = None
+IS_GLM_MOE_DSA_CACHE: bool | None = None
 
 
 def _is_glm_moe_dsa_model() -> bool:
@@ -94,9 +94,9 @@ def _is_glm_moe_dsa_model() -> bool:
     preserved because the fallback is only reached when the user set
     KV_FP8_ROPE=1 for their GLM model; KV_FP8_ROPE=0 short-circuits earlier.
     """
-    global _IS_GLM_MOE_DSA_CACHE
-    if _IS_GLM_MOE_DSA_CACHE is not None:
-        return _IS_GLM_MOE_DSA_CACHE
+    global IS_GLM_MOE_DSA_CACHE
+    if IS_GLM_MOE_DSA_CACHE is not None:
+        return IS_GLM_MOE_DSA_CACHE
     from vllm.config import get_current_vllm_config
 
     try:
@@ -108,7 +108,7 @@ def _is_glm_moe_dsa_model() -> bool:
         return False
     model_type = getattr(model_config.hf_config, "model_type", None)
     if model_type == "glm_moe_dsa":
-        _IS_GLM_MOE_DSA_CACHE = True
+        IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
     target_model_config = getattr(speculative_config, "target_model_config", None)
@@ -118,7 +118,7 @@ def _is_glm_moe_dsa_model() -> bool:
         else None
     )
     result = model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
-    _IS_GLM_MOE_DSA_CACHE = result
+    IS_GLM_MOE_DSA_CACHE = result
     return result
 
 

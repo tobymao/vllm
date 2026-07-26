@@ -17,35 +17,35 @@ from vllm.model_executor.layers.quantization import QuantizationConfig
 
 logger = init_logger(__name__)
 
-_NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
-_NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
-_NVFP4_MLA_NUM_LAYERS = 78
-_NVFP4_MLA_LATENT_DIM = 512
-_NVFP4_MLA_SCALE_DENOMINATOR = 6.0 * 448.0
-_NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
-_KV_FP8_ROPE_ENABLED = os.getenv("KV_FP8_ROPE", "0") == "1"
+NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
+NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
+NVFP4_MLA_NUM_LAYERS = 78
+NVFP4_MLA_LATENT_DIM = 512
+NVFP4_MLA_SCALE_DENOMINATOR = 6.0 * 448.0
+NVFP4_MLA_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)(?:\.|$)")
+KV_FP8_ROPE_ENABLED = os.getenv("KV_FP8_ROPE", "0") == "1"
 
 
-_IS_GLM_MOE_DSA_CACHE: bool | None = None
+IS_GLM_MOE_DSA_CACHE: bool | None = None
 
 
 def _is_glm_moe_dsa_model() -> bool:
     # Robust to being called before the vLLM config context is established
     # (cudagraph compilation in a worker): fall back to the explicit request and
     # re-resolve once the config is available. Only reached when KV_FP8_ROPE=1.
-    global _IS_GLM_MOE_DSA_CACHE
-    if _IS_GLM_MOE_DSA_CACHE is not None:
-        return _IS_GLM_MOE_DSA_CACHE
+    global IS_GLM_MOE_DSA_CACHE
+    if IS_GLM_MOE_DSA_CACHE is not None:
+        return IS_GLM_MOE_DSA_CACHE
     try:
         vllm_config = get_current_vllm_config()
     except Exception:
-        return _KV_FP8_ROPE_ENABLED
+        return KV_FP8_ROPE_ENABLED
     model_config = vllm_config.model_config
     if model_config is None:
         return False
     model_type = getattr(model_config.hf_config, "model_type", None)
     if model_type == "glm_moe_dsa":
-        _IS_GLM_MOE_DSA_CACHE = True
+        IS_GLM_MOE_DSA_CACHE = True
         return True
     speculative_config = getattr(vllm_config, "speculative_config", None)
     target_model_config = getattr(
@@ -57,7 +57,7 @@ def _is_glm_moe_dsa_model() -> bool:
         else None
     )
     result = model_type == "deepseek_mtp" and target_model_type == "glm_moe_dsa"
-    _IS_GLM_MOE_DSA_CACHE = result
+    IS_GLM_MOE_DSA_CACHE = result
     return result
 
 
@@ -67,57 +67,57 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
     with open(path, encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
-        raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} must contain a JSON object")
-    if payload.get("format") != _NVFP4_MLA_SCALES_FORMAT:
+        raise ValueError(f"{NVFP4_MLA_SCALES_ENV} must contain a JSON object")
+    if payload.get("format") != NVFP4_MLA_SCALES_FORMAT:
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} has unsupported format "
+            f"{NVFP4_MLA_SCALES_ENV} has unsupported format "
             f"{payload.get('format')!r}"
         )
     if type(payload.get("num_layers")) is not int or (
-        payload["num_layers"] != _NVFP4_MLA_NUM_LAYERS
+        payload["num_layers"] != NVFP4_MLA_NUM_LAYERS
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"num_layers={_NVFP4_MLA_NUM_LAYERS}"
+            f"{NVFP4_MLA_SCALES_ENV} must declare "
+            f"num_layers={NVFP4_MLA_NUM_LAYERS}"
         )
     if type(payload.get("latent_dim")) is not int or (
-        payload["latent_dim"] != _NVFP4_MLA_LATENT_DIM
+        payload["latent_dim"] != NVFP4_MLA_LATENT_DIM
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"latent_dim={_NVFP4_MLA_LATENT_DIM}"
+            f"{NVFP4_MLA_SCALES_ENV} must declare "
+            f"latent_dim={NVFP4_MLA_LATENT_DIM}"
         )
     denominator = payload.get("denominator")
     if isinstance(denominator, bool) or not isinstance(
         denominator, (int, float)
     ) or not math.isclose(
-        float(denominator), _NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
+        float(denominator), NVFP4_MLA_SCALE_DENOMINATOR, rel_tol=0.0, abs_tol=0.0
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must declare "
-            f"denominator={_NVFP4_MLA_SCALE_DENOMINATOR}"
+            f"{NVFP4_MLA_SCALES_ENV} must declare "
+            f"denominator={NVFP4_MLA_SCALE_DENOMINATOR}"
         )
     raw_scales = payload.get("scales")
     if not isinstance(raw_scales, list):
-        raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} must contain a scales list")
+        raise ValueError(f"{NVFP4_MLA_SCALES_ENV} must contain a scales list")
     if any(
         isinstance(value, bool) or not isinstance(value, (int, float))
         for value in raw_scales
     ):
-        raise ValueError(f"{_NVFP4_MLA_SCALES_ENV} scales must be JSON numbers")
+        raise ValueError(f"{NVFP4_MLA_SCALES_ENV} scales must be JSON numbers")
     scales = tuple(float(value) for value in raw_scales)
-    if len(scales) != _NVFP4_MLA_NUM_LAYERS or any(
+    if len(scales) != NVFP4_MLA_NUM_LAYERS or any(
         not math.isfinite(value) or value <= 0.0 for value in scales
     ):
         raise ValueError(
-            f"{_NVFP4_MLA_SCALES_ENV} must contain exactly "
-            f"{_NVFP4_MLA_NUM_LAYERS} finite positive scales"
+            f"{NVFP4_MLA_SCALES_ENV} must contain exactly "
+            f"{NVFP4_MLA_NUM_LAYERS} finite positive scales"
         )
     return scales
 
 
-_NVFP4_CALIB_CAPTURE = os.getenv("VLLM_NVFP4_MLA_CALIBRATE", "0") == "1"
-_NVFP4_CALIB_SEEN: dict[int, float] = {}
+NVFP4_CALIB_CAPTURE = os.getenv("VLLM_NVFP4_MLA_CALIBRATE", "0") == "1"
+NVFP4_CALIB_SEEN: dict[int, float] = {}
 
 
 def _nvfp4_calib_record(prefix: str, latent: torch.Tensor) -> None:
@@ -128,13 +128,13 @@ def _nvfp4_calib_record(prefix: str, latent: torch.Tensor) -> None:
     (6.0 * 448.0) is defined against. Logs only when a layer's max grows, so a
     long run does not flood the log while still converging on the true amax.
     """
-    match = _NVFP4_MLA_LAYER_RE.search(prefix)
+    match = NVFP4_MLA_LAYER_RE.search(prefix)
     if match is None:
         return
     idx = int(match.group(1))
     value = float(latent.detach().abs().amax().item())
-    if value > _NVFP4_CALIB_SEEN.get(idx, 0.0):
-        _NVFP4_CALIB_SEEN[idx] = value
+    if value > NVFP4_CALIB_SEEN.get(idx, 0.0):
+        NVFP4_CALIB_SEEN[idx] = value
         logger.info("nvfp4-calib layer=%d amax=%.6g", idx, value)
 
 
@@ -257,12 +257,12 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # quantizes with outer scale 1.0.  Feeding x/s_l is exactly the missing
         # writer-side normalization; the CuTe readers restore s_l in-kernel.
         self._nvfp4_mla_outer_scale = 1.0
-        scale_file = os.getenv(_NVFP4_MLA_SCALES_ENV, "").strip()
+        scale_file = os.getenv(NVFP4_MLA_SCALES_ENV, "").strip()
         if scale_file and (
             self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla"
             and self.mla_attn.attn_backend.get_name() == "B12X_MLA_SPARSE"
         ):
-            match = _NVFP4_MLA_LAYER_RE.search(prefix)
+            match = NVFP4_MLA_LAYER_RE.search(prefix)
             if match is None:
                 raise ValueError(
                     f"Cannot derive decoder layer index from MLA prefix {prefix!r}"
@@ -273,7 +273,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
             # the calibration set and keep s_l=1.0 (identity) rather than raising.
             # That layer is deep/late (not underflowing) and its KV is transient,
             # so identity there is a safe no-op for KLD.
-            if 0 <= layer_idx < _NVFP4_MLA_NUM_LAYERS:
+            if 0 <= layer_idx < NVFP4_MLA_NUM_LAYERS:
                 self._nvfp4_mla_outer_scale = _load_nvfp4_mla_outer_scales(
                     scale_file
                 )[layer_idx]
@@ -286,7 +286,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # cache writer receives k_pe after rotary_emb in forward(), making this
         # the requested POST-RoPE variant.
         self._kv_fp8_rope = bool(
-            _KV_FP8_ROPE_ENABLED
+            KV_FP8_ROPE_ENABLED
             and _is_glm_moe_dsa_model()
             and self.mla_attn.kv_cache_dtype == "nvfp4_ds_mla"
             and self.mla_attn.attn_backend.get_name() == "B12X_MLA_SPARSE"
@@ -340,7 +340,7 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
         # it needs the PRE-scale latent amax per layer -- which is exactly
         # kv_c_normed here, before the division below. Emits a line the
         # generator (glm/bench/nvfp4_mla_calibrate.py) parses.
-        if _NVFP4_CALIB_CAPTURE:
+        if NVFP4_CALIB_CAPTURE:
             _nvfp4_calib_record(self.prefix, kv_c_normed)
         # Normalize only the 512-D compressed latent before the cache writer.
         # k_pe is a separate 64-D BF16 tensor and remains bit-for-bit unscaled.
