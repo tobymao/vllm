@@ -280,13 +280,21 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         if choice == "auto":
             return None
         from vllm.model_executor.kernels.linear import (
+            B12xFp8BlockScaledMMKernel,
             CutlassFp8BlockScaledMMKernel,
             DeepGemmFp8BlockScaledMMKernel,
         )
 
+        # sparkinfer ships a third block-scaled FP8 GEMM. It was unreachable
+        # here until now: the global VLLM_USE_B12X_FP8_GEMM gate is inert
+        # because this scoped force_kernel wins, so setting that env changed
+        # nothing while every one of the 468 dense linears still logged
+        # CutlassFp8BlockScaledMMKernel. The dense block is 37.8% of the decode
+        # step, so a third implementation of it is worth an A/B.
         kernels = {
             "cutlass": CutlassFp8BlockScaledMMKernel,
             "deepgemm": DeepGemmFp8BlockScaledMMKernel,
+            "b12x": B12xFp8BlockScaledMMKernel,
         }
         if choice not in kernels:
             raise ValueError(
