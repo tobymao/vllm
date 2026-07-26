@@ -10,9 +10,12 @@ from functools import cache
 import torch
 
 from vllm.config import CacheConfig, get_current_vllm_config
+from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.attention import MLAAttention
 from vllm.model_executor.layers.quantization import QuantizationConfig
+
+logger = init_logger(__name__)
 
 _NVFP4_MLA_SCALES_ENV = "VLLM_NVFP4_MLA_SCALES_FILE"
 _NVFP4_MLA_SCALES_FORMAT = "nvfp4_ds_mla_outer_scale_v1"
@@ -111,6 +114,28 @@ def _load_nvfp4_mla_outer_scales(path: str) -> tuple[float, ...]:
             f"{_NVFP4_MLA_NUM_LAYERS} finite positive scales"
         )
     return scales
+
+
+_NVFP4_CALIB_CAPTURE = os.getenv("VLLM_NVFP4_MLA_CALIBRATE", "0") == "1"
+_NVFP4_CALIB_SEEN: dict[int, float] = {}
+
+
+def _nvfp4_calib_record(prefix: str, latent: torch.Tensor) -> None:
+    """Record a running per-layer amax of the pre-scale MLA latent.
+
+    Deliberately a running MAX rather than a per-call print: the calibration
+    must cover the whole run, and amax is what the format's denominator
+    (6.0 * 448.0) is defined against. Logs only when a layer's max grows, so a
+    long run does not flood the log while still converging on the true amax.
+    """
+    match = _NVFP4_MLA_LAYER_RE.search(prefix)
+    if match is None:
+        return
+    idx = int(match.group(1))
+    value = float(latent.detach().abs().amax().item())
+    if value > _NVFP4_CALIB_SEEN.get(idx, 0.0):
+        _NVFP4_CALIB_SEEN[idx] = value
+        logger.info("nvfp4-calib layer=%d amax=%.6g", idx, value)
 
 
 @dataclass
@@ -310,6 +335,13 @@ class MultiHeadLatentAttentionWrapper(PluggableLayer):
 
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_c_normed = self.kv_a_layernorm(kv_c)
+        # NVFP4 calibration capture (env-gated, off in serving). The outer scale
+        # this file loads is s_l = amax(latent_l) / (6.0 * 448.0), so generating
+        # it needs the PRE-scale latent amax per layer -- which is exactly
+        # kv_c_normed here, before the division below. Emits a line the
+        # generator (glm/bench/nvfp4_mla_calibrate.py) parses.
+        if _NVFP4_CALIB_CAPTURE:
+            _nvfp4_calib_record(self.prefix, kv_c_normed)
         # Normalize only the 512-D compressed latent before the cache writer.
         # k_pe is a separate 64-D BF16 tensor and remains bit-for-bit unscaled.
         kv_c_for_cache = kv_c_normed
