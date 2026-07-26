@@ -323,17 +323,13 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         # 128-row blocks. CutlassFp8BlockScaledMM hard-fails in
         # cutlass_gemm_caller for a ragged final row block: measured OK at
         # N=2560/2688/4096, RuntimeError at N=2624. GLM's fused q_a+kv_a
-        # projection is exactly N=2624, so without this it converts a layer the
-        # kernel cannot execute. Leave those on Marlin.
-        if output_size_per_partition % 128 != 0:
-            logger.info_once(
-                "GLM fp8-dense: skipping %s (N=%d is not a multiple of the 128-row "
-                "block scale granularity); keeping Marlin for this layer.",
-                self.layer_name,
-                output_size_per_partition,
-                scope="global",
-            )
-            return None
+        # projection is exactly N=2624 -- one per layer, 78 of them, which is a
+        # lot of Marlin to leave on the table. Pad the output dim up to the next
+        # 128 multiple with zero rows and slice the result back, rather than
+        # skipping the layer. The padding is always < 128 rows, so the final
+        # block still contains real weights and its block scale stays meaningful.
+        self.fp8_dense_padded_n = ((output_size_per_partition + 127) // 128) * 128
+        weight_shape = (self.fp8_dense_padded_n, input_size_per_partition)
 
         kernel = init_fp8_linear_kernel(
             activation_quant_key=create_fp8_quant_key(
@@ -381,6 +377,14 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             * scale.view(n, num_groups, 1)
         ).view(n, k).to(torch.bfloat16)
 
+        # Pad the output dim to a whole number of 128-row scale blocks. The
+        # padded rows are zero, so they contribute nothing to the product and
+        # are sliced off in apply_weights.
+        if self.fp8_dense_padded_n != n:
+            w_bf16 = torch.nn.functional.pad(
+                w_bf16, (0, 0, 0, self.fp8_dense_padded_n - n)
+            )
+
         use_e8m0 = is_deep_gemm_e8m0_used()
         w_fp8, w_scale = per_block_cast_to_fp8(
             w_bf16, block_size=[128, 128], use_ue8m0=use_e8m0
@@ -418,5 +422,11 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
         self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None
     ) -> torch.Tensor:
         if self.fp8_dense_kernel is not None:
-            return self.fp8_dense_kernel.apply_weights(layer, x, bias)
+            n = layer.output_size_per_partition
+            if self.fp8_dense_padded_n == n:
+                return self.fp8_dense_kernel.apply_weights(layer, x, bias)
+            # The weight was padded to a whole number of 128-row scale blocks;
+            # drop the padded columns before adding bias, whose shape is N.
+            out = self.fp8_dense_kernel.apply_weights(layer, x, None)[..., :n]
+            return out if bias is None else out + bias
         return self.kernel.apply_weights(layer, x, bias)
