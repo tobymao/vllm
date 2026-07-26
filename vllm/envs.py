@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_MHC: bool = False
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_GLM_FP8_DENSE: bool = False
+    VLLM_GLM_FP8_KERNEL: str = "auto"
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -1098,6 +1099,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dequantized and requantized to 128x128-block-scaled FP8 (E4M3); the int4
     # MoE experts are untouched. Opt-in numerics change (gate goldens before use).
     "VLLM_GLM_FP8_DENSE": lambda: bool(int(os.getenv("VLLM_GLM_FP8_DENSE", "0"))),
+    # Which block-scaled FP8 kernel VLLM_GLM_FP8_DENSE routes through:
+    # "auto" (normal priority order), "deepgemm", or "cutlass". The two differ
+    # sharply on SM121 and the priority order does not pick the faster one, so
+    # this exists to select it without a global --linear-backend (which would
+    # raise for the mixed-precision int4 MoE layers).
+    "VLLM_GLM_FP8_KERNEL": lambda: os.getenv("VLLM_GLM_FP8_KERNEL", "auto").lower(),
     # Use b12x for the DeepSeek V4 C4 sparse indexer and its top-k selection.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_SPARSE_INDEXER": lambda: bool(

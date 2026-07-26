@@ -267,6 +267,34 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             input_size_per_partition, output_size_per_partition, params_dtype
         )
 
+    @staticmethod
+    def _fp8_dense_force_kernel():
+        """Resolve VLLM_GLM_FP8_KERNEL to a concrete kernel class, or None.
+
+        The default priority order picks DeepGEMM on SM121, but the two
+        block-scaled FP8 kernels differ sharply here, so the choice needs to be
+        selectable. A global --linear-backend cannot be used: it also filters
+        the mixed-precision path, which raises for the int4 MoE experts.
+        """
+        choice = envs.VLLM_GLM_FP8_KERNEL
+        if choice == "auto":
+            return None
+        from vllm.model_executor.kernels.linear import (
+            CutlassFp8BlockScaledMMKernel,
+            DeepGemmFp8BlockScaledMMKernel,
+        )
+
+        kernels = {
+            "cutlass": CutlassFp8BlockScaledMMKernel,
+            "deepgemm": DeepGemmFp8BlockScaledMMKernel,
+        }
+        if choice not in kernels:
+            raise ValueError(
+                f"VLLM_GLM_FP8_KERNEL={choice!r} is not one of "
+                f"{['auto', *kernels]}"
+            )
+        return kernels[choice]
+
     def _maybe_build_fp8_dense_kernel(
         self,
         input_size_per_partition: int,
@@ -292,11 +320,11 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             return None
         # `should_use_deepgemm_for_fp8_linear` only demands N % 64 == 0, but the
         # 128x128 weight blocks mean the selected block-scaled kernel needs whole
-        # 128-row blocks. On SM121 the chosen kernel is CutlassFp8BlockScaledMM,
-        # which hard-fails in cutlass_gemm_caller for a ragged final row block:
-        # measured OK at N=2560/2688/4096, RuntimeError at N=2624. GLM's fused
-        # q_a+kv_a projection is exactly N=2624, so without this it converts a
-        # layer the kernel cannot execute. Leave those on Marlin.
+        # 128-row blocks. CutlassFp8BlockScaledMM hard-fails in
+        # cutlass_gemm_caller for a ragged final row block: measured OK at
+        # N=2560/2688/4096, RuntimeError at N=2624. GLM's fused q_a+kv_a
+        # projection is exactly N=2624, so without this it converts a layer the
+        # kernel cannot execute. Leave those on Marlin.
         if output_size_per_partition % 128 != 0:
             logger.info_once(
                 "GLM fp8-dense: skipping %s (N=%d is not a multiple of the 128-row "
@@ -317,6 +345,7 @@ class CompressedTensorsWNA16(CompressedTensorsScheme):
             input_dtype=params_dtype,
             out_dtype=params_dtype,
             weight_shape=weight_shape,
+            force_kernel=self._fp8_dense_force_kernel(),
             module_name=f"{self.layer_name} (GLM fp8-dense)",
         )
         logger.info_once(

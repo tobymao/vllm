@@ -4,6 +4,7 @@
 import torch
 import torch.nn.functional as F
 
+import vllm.envs as envs
 from vllm import _custom_ops as ops
 from vllm._aiter_ops import rocm_aiter_ops
 from vllm.model_executor.custom_op import CustomOp
@@ -13,12 +14,15 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     group_broadcast,
     prep_scale_for_group_broadcast,
 )
+from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
+
+logger = init_logger(__name__)
 
 _FP8_DTYPE = current_platform.fp8_dtype()
 _FP8_MIN, _FP8_MAX = get_fp8_min_max()
