@@ -1198,32 +1198,76 @@ def _dcp_topk_candidate_count(topk_tokens: int, dcp_world_size: int) -> int:
     return requested
 
 
-def _audit_dcp_candidate_coverage(
-    *,
-    candidate_score_bits: torch.Tensor,
-    final_scores: torch.Tensor,
-    rows: int,
-    dcp_world_size: int,
-    num_candidates: int,
-) -> None:
-    """Flag rows where a rank's truncated candidate list may have been short.
+AUDIT_THRESHOLDS = (512, 576, 640, 704, 768, 896, 1024)
+AUDIT_STATE: dict = {}
+AUDIT_LOG_EVERY = 200
 
-    A rank under-contributed if the weakest candidate it shipped still beats the
-    global cut-off, meaning it had more winners than it was allowed to send.
-    Forces a device sync, so this is diagnostic-only and never on in serving.
+
+def _audit_dcp_winner_spread(
+    *,
+    topk_indices: torch.Tensor,
+    dcp_world_size: int,
+    cp_kv_cache_interleave_size: int,
+) -> None:
+    """Measure how the elected winners actually distribute across DCP ranks.
+
+    This is the ground truth VLLM_DCP_TOPK_CANDIDATES is sized against: a rank
+    only needs to ship as many candidates as it can actually win. Run it at the
+    FULL width (VLLM_DCP_TOPK_CANDIDATES=0) so the counts are the real demand
+    and not the cap -- a truncated run can never report more than its own cap.
+
+    Winners carry global positions, and
+    `global = (local // I) * (W * I) + rank * I + (local % I)`
+    inverts to `rank = (global // I) % W`.
+
+    Accumulates on device; syncs only every AUDIT_LOG_EVERY calls.
     """
-    per_rank = candidate_score_bits.view(rows, dcp_world_size, num_candidates)
-    rank_min = per_rank.view(torch.float32).min(dim=2).values
-    cutoff = final_scores.min(dim=1).values.unsqueeze(1)
-    short_rows = int((rank_min > cutoff).any(dim=1).sum().item())
-    if short_rows:
-        logger.warning(
-            "DCP candidate truncation: %d/%d rows had a rank whose weakest "
-            "shipped candidate still beat the global cut-off. Raise "
-            "VLLM_DCP_TOPK_CANDIDATES (currently %d).",
-            short_rows,
-            rows,
-            num_candidates,
+    # Inert while a CUDA graph is being captured: the periodic .item() sync is
+    # illegal there, and a captured replay would re-run stale bookkeeping anyway.
+    # Prefill chunks (4096 tokens, far above max_cudagraph_capture_size) run
+    # outside graphs, which is where the long-context measurement comes from.
+    if torch.cuda.is_current_stream_capturing():
+        return
+
+    device = topk_indices.device
+    if "max" not in AUDIT_STATE:
+        AUDIT_STATE["max"] = torch.zeros((), dtype=torch.int32, device=device)
+        AUDIT_STATE["exceed"] = torch.zeros(
+            len(AUDIT_THRESHOLDS), dtype=torch.int64, device=device
+        )
+        AUDIT_STATE["rows"] = torch.zeros((), dtype=torch.int64, device=device)
+        AUDIT_STATE["calls"] = 0
+
+    rows = int(topk_indices.shape[0])
+    valid = topk_indices >= 0
+    # Park invalid entries in a spare bucket so they cannot inflate a real rank.
+    owner = torch.where(
+        valid,
+        (topk_indices // int(cp_kv_cache_interleave_size)) % int(dcp_world_size),
+        torch.full_like(topk_indices, int(dcp_world_size)),
+    )
+    counts = torch.zeros(
+        (rows, int(dcp_world_size) + 1), dtype=torch.int32, device=device
+    )
+    counts.scatter_add_(1, owner.long(), torch.ones_like(owner, dtype=torch.int32))
+    per_row_max = counts[:, : int(dcp_world_size)].max(dim=1).values
+
+    AUDIT_STATE["max"] = torch.maximum(AUDIT_STATE["max"], per_row_max.max())
+    AUDIT_STATE["rows"] += rows
+    for i, threshold in enumerate(AUDIT_THRESHOLDS):
+        AUDIT_STATE["exceed"][i] += (per_row_max > threshold).sum()
+
+    AUDIT_STATE["calls"] = int(AUDIT_STATE["calls"]) + 1
+    if int(AUDIT_STATE["calls"]) % AUDIT_LOG_EVERY == 0:
+        logger.info(
+            "DCP winner spread over %d rows: worst rank took %d of %d. "
+            "Rows needing more than %s: %s. A shortlist width is safe iff its "
+            "own entry is 0.",
+            int(AUDIT_STATE["rows"].item()),
+            int(AUDIT_STATE["max"].item()),
+            int(topk_indices.shape[1]),
+            list(AUDIT_THRESHOLDS),
+            AUDIT_STATE["exceed"].tolist(),
         )
 
 
@@ -1338,19 +1382,21 @@ def _merge_b12x_dcp_topk(
         output_values=topk_scores,
         output_indices=topk_indices,
     )
-    if narrowing and envs.VLLM_DCP_TOPK_CANDIDATES_AUDIT:
-        _audit_dcp_candidate_coverage(
-            candidate_score_bits=candidate_score_bits,
-            final_scores=topk_scores,
-            rows=rows,
-            dcp_world_size=int(dcp_world_size),
-            num_candidates=num_candidates,
-        )
     triton_gather_topk_ids_by_position(
         candidate_indices,
         topk_indices,
         topk_indices,
     )
+    # After the gather topk_indices holds the winners' GLOBAL positions, which is
+    # what the rank attribution needs. Deliberately not gated on `narrowing`: the
+    # measurement is only meaningful at full width, where the counts are the real
+    # demand rather than the cap.
+    if envs.VLLM_DCP_TOPK_CANDIDATES_AUDIT:
+        _audit_dcp_winner_spread(
+            topk_indices=topk_indices,
+            dcp_world_size=int(dcp_world_size),
+            cp_kv_cache_interleave_size=int(cp_kv_cache_interleave_size),
+        )
 
 
 def _convert_b12x_dcp_local_topk_to_global(
