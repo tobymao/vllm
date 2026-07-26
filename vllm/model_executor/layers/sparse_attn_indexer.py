@@ -1258,7 +1258,12 @@ def _audit_dcp_winner_spread(
         AUDIT_STATE["exceed"][i] += (per_row_max > threshold).sum()
 
     AUDIT_STATE["calls"] = int(AUDIT_STATE["calls"]) + 1
-    if int(AUDIT_STATE["calls"]) % AUDIT_LOG_EVERY == 0:
+    # Log on the FIRST call as well as every AUDIT_LOG_EVERY. A previous audit
+    # run produced zero output and it was impossible to tell whether the path
+    # was never reached or simply never hit the threshold; the first-call line
+    # separates those two cases immediately.
+    calls = int(AUDIT_STATE["calls"])
+    if calls == 1 or calls % AUDIT_LOG_EVERY == 0:
         logger.info(
             "DCP winner spread over %d rows: worst rank took %d of %d. "
             "Rows needing more than %s: %s. A shortlist width is safe iff its "
