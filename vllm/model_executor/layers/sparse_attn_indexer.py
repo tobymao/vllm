@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Custom Sparse Attention Indexer layers."""
 
+import functools
 import os
 
 import torch
@@ -1161,6 +1162,71 @@ def _run_b12x_paged_topk(
     )
 
 
+@functools.lru_cache(maxsize=None)
+def _dcp_topk_candidate_count(topk_tokens: int, dcp_world_size: int) -> int:
+    """How many candidates each DCP rank ships into the global top-k merge.
+
+    Defaults to `topk_tokens` (every rank sends its whole local top-k), which is
+    heavily over-provisioned under interleave-1 sharding -- see
+    VLLM_DCP_TOPK_CANDIDATES in envs.py for the sizing argument.
+    """
+    requested = int(envs.VLLM_DCP_TOPK_CANDIDATES)
+    if requested <= 0 or requested >= topk_tokens:
+        return topk_tokens
+    # The merge still has to be able to fill topk_tokens winners out of what the
+    # ranks collectively ship.
+    if requested * dcp_world_size < topk_tokens:
+        raise ValueError(
+            f"VLLM_DCP_TOPK_CANDIDATES={requested} is too small: "
+            f"{dcp_world_size} ranks x {requested} candidates cannot fill a "
+            f"top-{topk_tokens}. Use at least "
+            f"{-(-topk_tokens // dcp_world_size)}."
+        )
+    # triton_gather_topk_ids_by_position tiles the candidate width by 128.
+    if requested % 128 != 0:
+        raise ValueError(
+            f"VLLM_DCP_TOPK_CANDIDATES={requested} must be a multiple of 128."
+        )
+    logger.info(
+        "DCP global top-k: each rank ships %d of its %d local candidates "
+        "(all-gather payload %.1f KB/row instead of %.1f KB/row).",
+        requested,
+        topk_tokens,
+        requested * 2 * 4 / 1024,
+        topk_tokens * 2 * 4 / 1024,
+    )
+    return requested
+
+
+def _audit_dcp_candidate_coverage(
+    *,
+    candidate_score_bits: torch.Tensor,
+    final_scores: torch.Tensor,
+    rows: int,
+    dcp_world_size: int,
+    num_candidates: int,
+) -> None:
+    """Flag rows where a rank's truncated candidate list may have been short.
+
+    A rank under-contributed if the weakest candidate it shipped still beats the
+    global cut-off, meaning it had more winners than it was allowed to send.
+    Forces a device sync, so this is diagnostic-only and never on in serving.
+    """
+    per_rank = candidate_score_bits.view(rows, dcp_world_size, num_candidates)
+    rank_min = per_rank.view(torch.float32).min(dim=2).values
+    cutoff = final_scores.min(dim=1).values.unsqueeze(1)
+    short_rows = int((rank_min > cutoff).any(dim=1).sum().item())
+    if short_rows:
+        logger.warning(
+            "DCP candidate truncation: %d/%d rows had a rank whose weakest "
+            "shipped candidate still beat the global cut-off. Raise "
+            "VLLM_DCP_TOPK_CANDIDATES (currently %d).",
+            short_rows,
+            rows,
+            num_candidates,
+        )
+
+
 def _merge_b12x_dcp_topk(
     *,
     topk_indices: torch.Tensor,
@@ -1198,22 +1264,57 @@ def _merge_b12x_dcp_topk(
         raise RuntimeError("B12X sparse indexer DCP requires contiguous topk scores.")
 
     rows = int(topk_indices.shape[0])
-    candidate_width = int(dcp_world_size * topk_tokens)
+    num_candidates = _dcp_topk_candidate_count(int(topk_tokens), int(dcp_world_size))
+    narrowing = num_candidates != int(topk_tokens)
+    candidate_width = int(dcp_world_size * num_candidates)
+    specs = [
+        ((rows, 2, num_candidates), torch.int32),
+        ((rows * int(dcp_world_size), 2, num_candidates), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows, candidate_width), torch.int32),
+        ((rows,), torch.int32),
+    ]
+    if narrowing:
+        # Buffers for picking this rank's best `num_candidates` out of its local
+        # top-k before it goes on the wire. Requested in the same call so the
+        # workspace manager keeps them from aliasing the merge buffers.
+        specs += [
+            ((rows, num_candidates), torch.int32),
+            ((rows, num_candidates), torch.float32),
+            ((rows, num_candidates), torch.int32),
+            ((rows,), torch.int32),
+        ]
+    buffers = current_workspace_manager().get_simultaneous(*specs)
     (
         candidates,
         gathered_candidates,
         candidate_indices,
         candidate_score_bits,
         candidate_lengths,
-    ) = current_workspace_manager().get_simultaneous(
-        ((rows, 2, int(topk_tokens)), torch.int32),
-        ((rows * int(dcp_world_size), 2, int(topk_tokens)), torch.int32),
-        ((rows, candidate_width), torch.int32),
-        ((rows, candidate_width), torch.int32),
-        ((rows,), torch.int32),
-    )
-    candidates[:, 0, :].copy_(topk_indices)
-    candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
+    ) = buffers[:5]
+
+    if narrowing:
+        local_ids, local_scores, local_positions, local_lengths = buffers[5:]
+        # The local top-k comes back unsorted (tiled_topk runs with sorted=False),
+        # so the shortlist has to be selected by score rather than sliced.
+        local_lengths.fill_(int(topk_tokens))
+        run_row_topk(
+            row_logits=topk_scores,
+            lengths=local_lengths,
+            topk=num_candidates,
+            output_values=local_scores,
+            output_indices=local_positions,
+        )
+        triton_gather_topk_ids_by_position(
+            topk_indices,
+            local_positions,
+            local_ids,
+        )
+        candidates[:, 0, :].copy_(local_ids)
+        candidates[:, 1, :].copy_(local_scores.view(torch.int32))
+    else:
+        candidates[:, 0, :].copy_(topk_indices)
+        candidates[:, 1, :].copy_(topk_scores.view(torch.int32))
 
     dcp_group = get_dcp_group()
     _dcp_all_gather_first_dim_into(
@@ -1226,7 +1327,7 @@ def _merge_b12x_dcp_topk(
         candidate_indices,
         candidate_score_bits,
         dcp_world_size=dcp_world_size,
-        topk_tokens=int(topk_tokens),
+        topk_tokens=num_candidates,
     )
     candidate_scores = candidate_score_bits.view(torch.float32)
     candidate_lengths.fill_(candidate_width)
@@ -1237,6 +1338,14 @@ def _merge_b12x_dcp_topk(
         output_values=topk_scores,
         output_indices=topk_indices,
     )
+    if narrowing and envs.VLLM_DCP_TOPK_CANDIDATES_AUDIT:
+        _audit_dcp_candidate_coverage(
+            candidate_score_bits=candidate_score_bits,
+            final_scores=topk_scores,
+            rows=rows,
+            dcp_world_size=int(dcp_world_size),
+            num_candidates=num_candidates,
+        )
     triton_gather_topk_ids_by_position(
         candidate_indices,
         topk_indices,

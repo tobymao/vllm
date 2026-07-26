@@ -77,6 +77,8 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
     VLLM_DCP_GLOBAL_TOPK: bool = True
+    VLLM_DCP_TOPK_CANDIDATES: int = 0
+    VLLM_DCP_TOPK_CANDIDATES_AUDIT: bool = False
     VLLM_DCP_QUERY_SPLIT: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
@@ -1186,6 +1188,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
         os.getenv("VLLM_DCP_GLOBAL_TOPK", "1").lower() in ("1", "true", "yes", "on")
+    ),
+    # How many candidates each DCP rank contributes to the global top-k merge.
+    # 0 (default) means topk_tokens, i.e. every rank ships its full local top-k.
+    #
+    # That default is heavily over-provisioned. With
+    # --dcp-kv-cache-interleave-size 1 token i lives on rank i % world_size, so
+    # any query's causal keys are spread perfectly evenly and the global top-k
+    # splits ~topk/world_size per rank -- binomial, sigma = sqrt(topk * p * (1-p)).
+    # At topk=2048 and 4 ranks that is 512 +/- 19.6, so 768 sits ~13 sigma out.
+    # Even the worst case for concentration -- a query attending one contiguous
+    # block -- lands exactly topk/world_size per rank under interleave 1.
+    #
+    # The merge all-gathers (rows, 2, candidates) int32, so this scales the
+    # single largest un-attacked comm item on both phases: 16 KB/row at 2048
+    # versus 6 KB/row at 768.
+    "VLLM_DCP_TOPK_CANDIDATES": lambda: int(
+        os.getenv("VLLM_DCP_TOPK_CANDIDATES", "0")
+    ),
+    # Diagnostic for the above: count rows where a rank's truncated candidate
+    # list could not cover its share of the global top-k. Off by default because
+    # it forces a device->host sync and is not CUDA-graph safe.
+    "VLLM_DCP_TOPK_CANDIDATES_AUDIT": lambda: (
+        os.getenv("VLLM_DCP_TOPK_CANDIDATES_AUDIT", "0").lower()
+        in ("1", "true", "yes", "on")
     ),
     "VLLM_DCP_QUERY_SPLIT": lambda: (
         os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
