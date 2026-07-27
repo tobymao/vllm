@@ -3336,9 +3336,11 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
                 if hasattr(self.kv_b_proj, "weight")
                 else self.kv_b_proj.params_dtype
             )
+            # Same packed-container rule as _compute_prefill_context above; this
+            # is the branch forward_mha takes when dcp_world_size > 1.
             if (
                 use_fp8_prefill or kv_b_proj_w_dtype != current_platform.fp8_dtype()
-            ) and kv_b_proj_w_dtype != torch.uint8:
+            ) and not is_packed_quantized_dtype(kv_b_proj_w_dtype):
                 kv_c_normed = kv_c_normed.to(kv_b_proj_w_dtype)
 
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
