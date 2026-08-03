@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_MIN_TOKENS: int = 4096
     VLLM_DEEPSEEK_V4_INDEXED_D512_SPLIT_PREFILL_WARMUP: bool = True
     VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL: bool = True
+    VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL: bool = False
     # Default ON (SM12x + FlashInfer >= 0.6.14 kernel present): route DSv4 sparse
     # MLA through the FlashInfer SM120 packed path (prefill + decode). No effect
     # elsewhere -- the selector still gates on SM12x + has_flashinfer_trtllm_
@@ -1550,6 +1551,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_INDEXED_D512_CHUNKED_PREFILL", "1"))
+    ),
+    # Default OFF: the eager scratch pool reuses buffers across template
+    # families and layers without the caching allocator's event-guarded
+    # cross-stream safety; under concurrent mixed prefill+decode load this
+    # races and corrupts output (see PR #41834 discussion). Re-enable only
+    # once producer/consumer ordering is enforced with events.
+    "VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL": lambda: bool(
+        int(os.getenv("VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL", "0"))
     ),
     "VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE": lambda: bool(
         int(os.getenv("VLLM_DEEPSEEK_V4_FLASHINFER_SM120_DECODE", "1"))

@@ -1199,7 +1199,16 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             n_local_heads
         )
         self.eager_scratch_pool: DeepseekV4EagerScratchPool | None = None
-        if not vllm_config.parallel_config.use_ubatching:
+        # Gated default-off: the pool's cross-family and cross-layer buffer
+        # reuse races with the aux-stream overlap in the attention eager break,
+        # corrupting output under concurrent mixed prefill+decode load. The
+        # separated-family sizing (d42b8d9) narrows but does not close the
+        # window; every consumer falls back to per-call allocation (allocator
+        # cross-stream safety) when the pool is absent. See PR #41834.
+        if (
+            envs.VLLM_DEEPSEEK_V4_EAGER_SCRATCH_POOL
+            and not vllm_config.parallel_config.use_ubatching
+        ):
             # TODO: support dbo if needed
             # this requires the buffer to have ubatch dim
             self.eager_scratch_pool = DeepseekV4EagerScratchPool(
