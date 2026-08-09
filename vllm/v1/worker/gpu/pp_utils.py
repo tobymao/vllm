@@ -181,21 +181,6 @@ class PPHandler:
 
         assert sampled_token_ids.dtype == torch.int64
 
-        # The receiver always allocates a fixed [num_reqs, max_sample_len] buffer, but
-        # sampled_token_ids can be narrower than max_sample_len -- e.g. width 1 on a
-        # prefill (or any non-spec) step, which is exactly what breaks the first decode
-        # of a fresh request and every warmup step under PP+spec. NCCL broadcast requires
-        # matching element counts across ranks, so pad the tail with -1 (the sentinel the
-        # receiver's consume path already skips; num_sampled bounds the valid width).
-        if sampled_token_ids.shape[1] < self.max_sample_len:
-            pad = torch.full(
-                (sampled_token_ids.shape[0], self.max_sample_len - sampled_token_ids.shape[1]),
-                -1,
-                dtype=sampled_token_ids.dtype,
-                device=sampled_token_ids.device,
-            )
-            sampled_token_ids = torch.cat((sampled_token_ids, pad), dim=1)
-
         if current_platform.is_xpu():
             self.main_stream.synchronize()
 

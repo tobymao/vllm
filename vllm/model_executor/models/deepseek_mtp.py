@@ -810,20 +810,6 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
                     continue
             if "rotary_emb.inv_freq" in name:
                 continue
-            # GLM/DeepSeek MTP shares the main model's token embedding, so the
-            # checkpoint has no per-MTP-layer embed_tokens weight -- only the top-level
-            # `model.embed_tokens.weight`. On a single PP stage the speculator shares the
-            # target's embedding after load, but under pipeline parallelism the target's
-            # embedding lives on the first stage (PPMissingLayer on the last rank, where
-            # the draft runs), so the sharing is skipped and the draft must load its own
-            # copy here. Without this the draft's embed_tokens stays uninitialized and the
-            # draft proposes garbage -> acceptance collapses to ~1 (no speedup).
-            if name == "model.embed_tokens.weight" and self.model.embed_tokens is not None:
-                param = params_dict["model.embed_tokens.weight"]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-                loaded_params.add("model.embed_tokens.weight")
-                continue
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is None:
                 continue
