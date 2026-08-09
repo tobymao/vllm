@@ -1098,9 +1098,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Log adjacent-query top-k overlap and four-query union amplification for
     # sparse-indexer prefill rows whose causal context exceeds index_topk.
-    "VLLM_SPARSE_INDEXER_OVERLAP_DIAGNOSTIC": lambda: bool(
-        int(os.getenv("VLLM_SPARSE_INDEXER_OVERLAP_DIAGNOSTIC", "0"))
-    ),
     # Route GLM-5.2 (Int4-Int8Mix) INT8 *dense* linear projections (attention
     # q/kv/o, fused_qkv_a, shared-expert linears) through the blockwise-FP8
     # DeepGEMM kernel instead of Marlin w8a16. At load, eligible INT8 weights are
