@@ -89,15 +89,6 @@ def get_sequence_parallelism_threshold(
         # Collapse Blackwell variants (sm100/sm103/...) into one policy bucket.
         if current_platform.is_device_capability_family(100):
             device_capability = 100
-        elif current_platform.is_device_capability_family(120):
-            # Same for the SM120 family (sm120/sm121/...). Without this, only a
-            # literal sm120 matched the table below and every other member --
-            # GB10/sm121 included -- fell through to `.get(capability)`, missed,
-            # and silently lost sequence parallelism. That is backwards: the
-            # SM120 entry exists precisely because these parts have no NVLink,
-            # so allreduce is expensive relative to compute and SP pays off at
-            # smaller shapes than on H100/B200.
-            device_capability = 120
         else:
             device_capability = capability.to_int()
 
