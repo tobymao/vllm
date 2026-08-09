@@ -44,13 +44,7 @@ from .deepseek_v2 import (
     _try_load_fp8_indexer_wk,
     get_spec_layer_idx_from_weight_name,
 )
-from .interfaces import SupportsPP
-from .utils import (
-    get_draft_quant_config,
-    get_pp_missing_layer_names,
-    make_empty_intermediate_tensors_factory,
-    maybe_prefix,
-)
+from .utils import get_draft_quant_config, get_pp_missing_layer_names, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -633,18 +627,7 @@ class DeepSeekMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
-    # SupportsPP here means "safe to instantiate co-located on the LAST pipeline
-    # stage", NOT "pipelined across stages". vLLM's V1/V2 spec-decode runners build
-    # and run the MTP draft only on the last PP rank (gpu_model_runner drafter gate;
-    # gpu/model_runner.py:240 is_last_pp_rank), fed the target's last-stage final
-    # hidden state; the draft is never sharded across PP stages and never receives
-    # IntermediateTensors. Therefore this model must NEVER partition its layers by PP
-    # rank (no make_layers/PPMissingLayer over the MTP blocks) -- doing so would
-    # materialize the wrong/empty slice on the one rank that runs the drafter. The
-    # interface was removed upstream in 600aaab8d as a type-purity cleanup with no
-    # functional rationale; restoring it is what unblocks MTP under pipeline
-    # parallelism (config gate at config/model.py verify_with_parallel_config).
+class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
     def __init__(
         self,
         *,
@@ -663,13 +646,6 @@ class DeepSeekMTP(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts):
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
             allocate_shared_weights=allocate_shared_weights,
-        )
-        # Honest SupportsPP interface. Never actually called at runtime (the draft
-        # exists only on the last PP rank, which never receives intermediate tensors),
-        # but it makes the interface truthful and guards future proposer/profiling
-        # changes. Keys/hidden_size mirror the main model (deepseek_v2.py:1535).
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
-            ["hidden_states", "residual"], self.config.hidden_size
         )
         # Set MoE hyperparameters
         self.set_moe_parameters()
