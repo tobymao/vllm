@@ -19,6 +19,9 @@ from vllm.model_executor.kernels.attention.b12x_mxfp8_bmm import (
     warmup_fused_mla_query,
 )
 from vllm.model_executor.kernels.linear.mxfp8.b12x import warmup_b12x_mxfp8_linear
+from vllm.model_executor.kernels.linear.scaled_mm.b12x_tensor import (
+    warmup_b12x_tensor_fp8_linear,
+)
 from vllm.model_executor.layers.fused_moe.b12x_moe import warmup_b12x_moe_dynamic
 from vllm.model_executor.warmup.b12x_sparse_indexer_warmup import (
     warmup_b12x_sparse_indexer,
@@ -135,11 +138,12 @@ def _contains_flashinfer_object(
 
 
 def _uses_flashinfer_attention(runner: "GPUModelRunner") -> bool:
+    attn_groups = getattr(runner, "attn_groups", None)
     return bool(
-        runner.attn_groups
+        attn_groups
         and any(
             _is_flashinfer_backend(group.backend)
-            for groups in runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     )
@@ -303,6 +307,22 @@ def kernel_warmup(worker: "Worker"):
     if warmed_mxfp8:
         logger.info("Warmed up %d B12X MXFP8 linear GEMM signatures.", warmed_mxfp8)
 
+    warmed_tensor_fp8 = warmup_b12x_tensor_fp8_linear(
+        worker.get_model(),
+        max_tokens=worker.scheduler_config.max_num_batched_tokens,
+        cudagraph_capture_sizes=cudagraph_capture_sizes,
+        output_dtype=getattr(
+            getattr(worker, "model_config", None),
+            "dtype",
+            torch.bfloat16,
+        ),
+    )
+    if warmed_tensor_fp8:
+        logger.info(
+            "Warmed up %d B12X tensor FP8 linear GEMM signatures.",
+            warmed_tensor_fp8,
+        )
+
     warmed_mla_bmm = warmup_b12x_mla_mxfp8_bmm(worker.get_model())
     if warmed_mla_bmm:
         logger.info(
@@ -375,15 +395,16 @@ def kernel_warmup(worker: "Worker"):
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
     # and is not a pooling model
+    attn_groups = getattr(worker.model_runner, "attn_groups", None)
     if (
         not worker.model_runner.is_pooling_model
-        and worker.model_runner.attn_groups
+        and attn_groups
         # NOTE: This should be `any` instead of `all` but other hybrid attention
         # backends don't support this dummy run. Once we remove
         # `build_for_cudagraph_capture`, we can change it to `any`.
         and all(
             _is_flashinfer_backend(group.backend)
-            for groups in worker.model_runner.attn_groups
+            for groups in attn_groups
             for group in groups
         )
     ):

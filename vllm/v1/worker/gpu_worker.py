@@ -53,7 +53,6 @@ from vllm.lora.request import LoRARequest
 from vllm.model_executor.warmup.deepseek_v4_compressor_warmup import (
     deepseek_v4_compressor_triton_warmup,
 )
-from vllm.model_executor.warmup.kernel_warmup import kernel_warmup
 from vllm.multimodal.video import (
     PYNVVIDEOCODEC_CUDA_CONTEXT_BYTES,
     PYNVVIDEOCODEC_DECODER_GPU_MEMORY_BYTES,
@@ -91,6 +90,23 @@ from .gpu.warmup import warmup_kernels
 from .utils import request_memory
 
 logger = init_logger(__name__)
+
+
+def kernel_warmup(worker: "Worker") -> None:
+    """Run kernel warmup without importing its CUDA dependencies on preload.
+
+    Args:
+        worker: Worker whose kernels should be warmed up.
+
+    Returns:
+        None.
+    """
+    from vllm.model_executor.warmup.kernel_warmup import (
+        kernel_warmup as run_kernel_warmup,
+    )
+
+    run_kernel_warmup(worker)
+
 
 if TYPE_CHECKING:
     from vllm.device_allocator.sleep_mode_backend import SleepModeBackend
@@ -454,6 +470,33 @@ class Worker(WorkerBase):
     def reload_weights(self, *args, **kwargs) -> None:
         self.model_runner.reload_weights(*args, **kwargs)
 
+    def _warmup_kernels_once(self) -> None:
+        """Materialize persistent kernel resources before KV cache sizing."""
+        if getattr(self, "_kernel_warmup_complete", False):
+            return
+        kernel_warmup(self)
+        self._kernel_warmup_complete = True
+
+    def _profile_model_with_kernel_warmup(self) -> None:
+        """Profile activations on top of persistent kernel allocations."""
+        # The first pass initializes runner state required by some warmups.
+        self.model_runner.profile_run()
+        deepseek_v4_compressor_triton_warmup(
+            self.get_model(), self.get_kv_cache_spec(), self.vllm_config
+        )
+        self._warmup_kernels_once()
+
+        # The first pass may include one-time compiler or loader temporaries.
+        # Keep every persistent allocation initialized above, but exclude that
+        # startup-only high-water mark from the activation measurement. The
+        # second pass below establishes the repeatable serving peak.
+        torch.accelerator.reset_peak_memory_stats(self.device)
+
+        # Kernel warmup can create persistent modules and communication pools.
+        # A second pass is required so the measured peak contains both those
+        # allocations and the model's transient activation workspace.
+        self.model_runner.profile_run()
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -476,6 +519,7 @@ class Worker(WorkerBase):
             deepseek_v4_compressor_triton_warmup(
                 self.get_model(), self.get_kv_cache_spec(), self.vllm_config
             )
+            self._warmup_kernels_once()
 
             msg = (
                 f"Initial free memory {format_gib(self.init_snapshot.free_memory)} "
@@ -498,10 +542,7 @@ class Worker(WorkerBase):
             self.init_snapshot,
             weights_memory=int(self.model_runner.model_memory_usage),
         ) as profile_result:
-            self.model_runner.profile_run()
-            deepseek_v4_compressor_triton_warmup(
-                self.get_model(), self.get_kv_cache_spec(), self.vllm_config
-            )
+            self._profile_model_with_kernel_warmup()
 
             profile_torch_peak = torch.accelerator.memory_stats(self.device).get(
                 "allocated_bytes.all.peak", 0
@@ -797,7 +838,7 @@ class Worker(WorkerBase):
 
         # Warmup and tune the kernels used during model execution before
         # cuda graph capture.
-        kernel_warmup(self)
+        self._warmup_kernels_once()
 
         cuda_graph_memory_bytes = 0
         if not self.model_config.enforce_eager:
@@ -924,7 +965,7 @@ class Worker(WorkerBase):
         # Keep vLLM's stable B12X diagnostics while notifying the renamed
         # external package that post-start kernel compilation is unexpected.
         os.environ["B12X_VLLM_ENGINE_STARTED"] = "1"
-        os.environ["SPARKINFER_ENGINE_STARTED"] = "1"
+        os.environ["B12X_ENGINE_STARTED"] = "1"
 
         activate_jit_monitor(
             mode=self.observability_config.jit_monitor_mode,

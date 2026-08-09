@@ -5,11 +5,11 @@
 Counterpart to ``SparseMLASm120Backend`` (FlashInfer V32 v2). Same envelope --
 ``fp8_ds_mla`` KV cache (656 B/token), head_size = 576, paged block_size = 64,
 V32-family models with an ``index_topk`` config (DeepSeek V3.2, GLM-5.1, Kimi
-K2.5) -- but the decode/extend kernels come from SparkInfer's unified SM120
-backend via the ``sparkinfer.attention.sparse_mla`` front door (``run_decode`` /
-``run_extend``). On SM120+ CUDA those front-door functions route to SparkInfer's
+K2.5) -- but the decode/extend kernels come from B12X's unified SM120
+backend via the ``b12x.attention.sparse_mla`` front door (``run_decode`` /
+``run_extend``). On SM120+ CUDA those front-door functions route to B12X's
 unified MLA implementation automatically (GLM_NSA q_head_dim==576 contract).
-Selecting this backend also selects SparkInfer's sparse indexer/top-k path.
+Selecting this backend also selects B12X's sparse indexer/top-k path.
 
 Scratch philosophy (eager PLAN -> BIND -> KERNEL; no workspace/arena, ever):
 b12x workspaces/arenas are sglang-only and forbidden here. We build a caller-
@@ -27,6 +27,7 @@ ONE ``get_simultaneous`` call so they never alias.
 
 import inspect
 import os
+import weakref
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, ClassVar, cast
 
@@ -39,6 +40,9 @@ from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mla_attention import get_mla_dims
+from vllm.model_executor.layers.mla_cache_format import (
+    NVFP4_MLA_CACHE_FORMAT,
+)
 from vllm.platforms.interface import DeviceCapability
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
@@ -77,8 +81,7 @@ _BF16_BYTES = 2
 _EXTEND_PREWARM_DONE: set[
     tuple[int | None, int, int, int, int, int, bool, str, bool]
 ] = set()
-_CKV_GATHER_WORKSPACES: dict[tuple[str, int | None], torch.Tensor] = {}
-_KV_FP8_ROPE_REQUESTED = os.getenv("KV_FP8_ROPE", "0") == "1"
+KV_FP8_ROPE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.fp8_rope
 
 
 IS_GLM_MOE_DSA_CACHE: bool | None = None
@@ -102,7 +105,7 @@ def _is_glm_moe_dsa_model() -> bool:
     try:
         vllm_config = get_current_vllm_config()
     except Exception:
-        return _KV_FP8_ROPE_REQUESTED
+        return KV_FP8_ROPE_REQUESTED
     model_config = vllm_config.model_config
     if model_config is None:
         return False
@@ -124,7 +127,32 @@ def _is_glm_moe_dsa_model() -> bool:
 
 def _kv_fp8_rope_enabled() -> bool:
     """Strict public gate plus literal GLM architecture selection."""
-    return _KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
+    return KV_FP8_ROPE_REQUESTED and _is_glm_moe_dsa_model()
+
+
+# Inline-scale two-level NVFP4 records: the writer derives a per-token
+# second-level scale (fp32 at record bytes [292, 296)) and the readers consume
+# it from the record instead of a per-layer launch scalar.  Requires the
+# 368-byte KV_FP8_ROPE=1 record and a B12X build with the matching
+# writer/reader mode.  Mutually exclusive with VLLM_NVFP4_MLA_SCALES_FILE.
+NVFP4_DYNAMIC_SCALE_REQUESTED = NVFP4_MLA_CACHE_FORMAT.dynamic_scale
+
+
+def _require_callable_parameters(
+    feature: str,
+    callables: tuple[tuple[str, Any], ...],
+    required: frozenset[str],
+) -> None:
+    unsupported = [
+        name
+        for name, function in callables
+        if not required.issubset(inspect.signature(function).parameters)
+    ]
+    if unsupported:
+        raise RuntimeError(
+            f"{feature} requires B12X callables accepting "
+            f"{sorted(required)!r}; unsupported: {', '.join(unsupported)}"
+        )
 
 
 def _cdiv(x: int, y: int) -> int:
@@ -146,18 +174,316 @@ def _env_int(name: str, default: int) -> int:
     return parsed
 
 
-def _get_ckv_gather_workspace(device: torch.device, nbytes: int) -> torch.Tensor:
-    key = (device.type, device.index)
-    workspace = _CKV_GATHER_WORKSPACES.get(key)
-    if workspace is None:
-        workspace = torch.empty((nbytes,), dtype=torch.uint8, device=device)
-        _CKV_GATHER_WORKSPACES[key] = workspace
-    elif workspace.numel() < nbytes:
-        raise RuntimeError(
-            "CKV gather workspace cannot grow after attention layers retain "
-            f"aliases: existing={workspace.numel()} requested={nbytes}"
+def _ckv_prefetch_supports_format(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla")
+
+
+def _ckv_prefetch_ring_slots(depth: int) -> int:
+    return max(0, int(depth)) + 1
+
+
+def _ckv_prefetch_workspace_nbytes(
+    depth: int,
+    dcp_world_size: int,
+    local_capacity: int,
+    record_bytes: int,
+) -> int:
+    """Return one lane's local staging plus gathered-cache ring size."""
+    return (
+        (1 + _ckv_prefetch_ring_slots(depth) * int(dcp_world_size))
+        * int(local_capacity)
+        * int(record_bytes)
+    )
+
+
+def _ckv_prefetch_execution_lanes(num_ubatches: int, speculative: bool) -> int:
+    return max(1, int(num_ubatches)) * (2 if speculative else 1)
+
+
+class _CKVPrefetchWorkspacePool:
+    """Preallocated CKV rings shared by all attention layers on one device."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        slot_nbytes: int,
+        max_slots: int,
+    ) -> None:
+        if slot_nbytes <= 0 or max_slots <= 0:
+            raise ValueError(
+                "CKV workspace pool requires positive slot size and count, got "
+                f"slot_nbytes={slot_nbytes} max_slots={max_slots}"
+            )
+        self.device = device
+        self.slot_nbytes = int(slot_nbytes)
+        self.max_slots = int(max_slots)
+        self.storage = torch.empty(
+            (self.slot_nbytes * self.max_slots,),
+            dtype=torch.uint8,
+            device=device,
         )
-    return workspace[:nbytes]
+        self._free_slots = list(reversed(range(self.max_slots)))
+        self._leased_slots: set[int] = set()
+
+    def acquire(self) -> tuple[int, torch.Tensor]:
+        if not self._free_slots:
+            raise RuntimeError(
+                "CKV prefetch workspace pool exhausted. The runtime created more "
+                f"than {self.max_slots} execution lanes; disable CKV prefetch or "
+                "increase the configured lane reservation."
+            )
+        slot = self._free_slots.pop()
+        self._leased_slots.add(slot)
+        start = slot * self.slot_nbytes
+        return slot, self.storage.narrow(0, start, self.slot_nbytes)
+
+    def release(self, slot: int) -> None:
+        if slot not in self._leased_slots:
+            raise RuntimeError(f"CKV workspace slot {slot} is not leased")
+        self._leased_slots.remove(slot)
+        self._free_slots.append(slot)
+
+
+_CKV_PREFETCH_WORKSPACE_POOLS: dict[
+    tuple[str, int | None, int, int], _CKVPrefetchWorkspacePool
+] = {}
+
+
+def _get_ckv_prefetch_workspace_pool(
+    device: torch.device,
+    slot_nbytes: int,
+    max_slots: int,
+) -> _CKVPrefetchWorkspacePool:
+    key = (device.type, device.index, int(slot_nbytes), int(max_slots))
+    pool = _CKV_PREFETCH_WORKSPACE_POOLS.get(key)
+    if pool is None:
+        pool = _CKVPrefetchWorkspacePool(device, slot_nbytes, max_slots)
+        _CKV_PREFETCH_WORKSPACE_POOLS[key] = pool
+    return pool
+
+
+def _ckv_prefetch_depth_within_budget(
+    requested_depth: int,
+    workspace_budget_bytes: int,
+    dcp_world_size: int,
+    local_capacity: int,
+    record_bytes: int,
+) -> int:
+    """Cap lookahead depth without removing the synchronous gather slot."""
+    requested_depth = max(0, int(requested_depth))
+    workspace_budget_bytes = int(workspace_budget_bytes)
+    if workspace_budget_bytes <= 0:
+        return requested_depth
+    for depth in range(requested_depth, -1, -1):
+        if (
+            _ckv_prefetch_workspace_nbytes(
+                depth,
+                dcp_world_size,
+                local_capacity,
+                record_bytes,
+            )
+            <= workspace_budget_bytes
+        ):
+            return depth
+    return 0
+
+
+def _ckv_prefetch_target_indices(
+    layer_idx: int,
+    depth: int,
+    layer_caches: list[torch.Tensor | None],
+    pending_layers: dict[int, tuple[Any, int]],
+) -> list[int]:
+    targets: list[int] = []
+    for distance in range(1, max(0, int(depth)) + 1):
+        target_idx = layer_idx + distance
+        if target_idx in pending_layers:
+            continue
+        if target_idx >= len(layer_caches) or layer_caches[target_idx] is None:
+            break
+        targets.append(target_idx)
+    return targets
+
+
+@dataclass(frozen=True)
+class _CKVWorkspaceIdentity:
+    device: torch.device
+    storage_data_ptr: int
+    storage_nbytes: int
+    data_ptr: int
+    storage_offset: int
+    shape: tuple[int, ...]
+    stride: tuple[int, ...]
+    dtype: torch.dtype
+
+
+def _ckv_workspace_identity(workspace: torch.Tensor) -> _CKVWorkspaceIdentity:
+    storage = workspace.untyped_storage()
+    return _CKVWorkspaceIdentity(
+        device=workspace.device,
+        # WorkspaceManager exposes transient tensor views, so tensor identity is
+        # not stable across borrows. The storage base and size are public,
+        # stable allocation metadata; liveness is tracked separately below.
+        storage_data_ptr=storage.data_ptr(),
+        storage_nbytes=storage.nbytes(),
+        data_ptr=workspace.data_ptr(),
+        storage_offset=workspace.storage_offset(),
+        shape=tuple(workspace.shape),
+        stride=tuple(workspace.stride()),
+        dtype=workspace.dtype,
+    )
+
+
+class _CKVPrefetchState:
+    """Cross-layer state for one workspace allocation and execution lane."""
+
+    def __init__(
+        self,
+        workspace_identity: _CKVWorkspaceIdentity,
+        workspace: torch.Tensor,
+        workspace_pool: _CKVPrefetchWorkspacePool,
+    ) -> None:
+        self.workspace_identity = workspace_identity
+        self.workspace_storage_ref = weakref.ref(workspace.untyped_storage())
+        self.workspace_pool = workspace_pool
+        self.layer_caches: list[torch.Tensor | None] = []
+        self.pending_layers: dict[int, tuple[Any, int]] = {}
+        self.gather_stream: torch.cuda.Stream | None = None
+        self.ckv_workspace: torch.Tensor | None = None
+        self.ckv_workspace_slot: int | None = None
+        self.ckv_workspace_generation = 0
+        self.last_layer_idx: int | None = None
+
+    def begin_step(self) -> None:
+        self.wait_for_pending_writes()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
+
+    def wait_for_pending_writes(self) -> None:
+        """Order current-stream fallback work after side-stream gathers."""
+        for event, _ in self.pending_layers.values():
+            # Preserve ring ordering without blocking the host indefinitely.
+            # The next main-stream gather is enqueued after these dependencies.
+            event.wait()
+
+    def enter_layer(self, layer_idx: int) -> None:
+        if self.last_layer_idx is not None and layer_idx <= self.last_layer_idx:
+            self.begin_step()
+        self.last_layer_idx = layer_idx
+
+    def register_cache(self, layer_idx: int, kv_cache: torch.Tensor) -> None:
+        while len(self.layer_caches) <= layer_idx:
+            self.layer_caches.append(None)
+        self.layer_caches[layer_idx] = kv_cache
+
+    def get_gather_stream(self) -> torch.cuda.Stream:
+        if self.gather_stream is None:
+            self.gather_stream = torch.cuda.Stream(
+                device=self.workspace_identity.device
+            )
+        return self.gather_stream
+
+    def get_ckv_workspace(self, nbytes: int) -> torch.Tensor:
+        if nbytes != self.workspace_pool.slot_nbytes:
+            raise ValueError(
+                "CKV workspace size changed after the persistent pool was "
+                f"allocated: pool={self.workspace_pool.slot_nbytes} requested={nbytes}"
+            )
+        if self.ckv_workspace is None:
+            slot, workspace = self.workspace_pool.acquire()
+            self.ckv_workspace_slot = slot
+            self.ckv_workspace = workspace
+            self.ckv_workspace_generation += 1
+        return self.ckv_workspace
+
+    def close(self) -> None:
+        # ``Event.wait`` only orders work on the current stream. A released pool
+        # slot can be acquired by another execution lane and written from a
+        # different stream, so retirement must complete outstanding writers.
+        for event, _ in self.pending_layers.values():
+            event.synchronize()
+        self.pending_layers.clear()
+        self.last_layer_idx = None
+        if self.ckv_workspace_slot is not None:
+            self.workspace_pool.release(self.ckv_workspace_slot)
+            self.ckv_workspace_slot = None
+            self.ckv_workspace = None
+
+
+_CKV_PREFETCH_STATE_REGISTRIES: weakref.WeakSet = weakref.WeakSet()
+
+
+class _CKVPrefetchStateRegistry:
+    """Builder-owned states partitioned by lane-scoped CKV workspace."""
+
+    def __init__(self, workspace_pool: _CKVPrefetchWorkspacePool | None = None) -> None:
+        self.states: dict[_CKVWorkspaceIdentity, _CKVPrefetchState] = {}
+        self.workspace_pool = workspace_pool
+        _CKV_PREFETCH_STATE_REGISTRIES.add(self)
+
+    def _bind_workspace_pool(self, pool: _CKVPrefetchWorkspacePool) -> None:
+        if self.workspace_pool is None:
+            self.workspace_pool = pool
+        elif self.workspace_pool is not pool:
+            raise RuntimeError("CKV prefetch registry cannot switch workspace pools")
+
+    def _retire(self, identities: list[_CKVWorkspaceIdentity]) -> None:
+        for identity in identities:
+            self.states.pop(identity).close()
+
+    def _prune_released_workspaces(self) -> None:
+        self._retire(
+            [
+                identity
+                for identity, state in self.states.items()
+                if state.workspace_storage_ref() is None
+            ]
+        )
+
+    def begin_step(self) -> None:
+        self._prune_released_workspaces()
+        for state in self.states.values():
+            state.begin_step()
+
+    def clear(self) -> None:
+        self._retire(list(self.states))
+
+    def for_workspace(
+        self,
+        workspace: torch.Tensor,
+        layer_idx: int | None = None,
+        kv_cache: torch.Tensor | None = None,
+        workspace_pool: _CKVPrefetchWorkspacePool | None = None,
+    ) -> _CKVPrefetchState:
+        self._prune_released_workspaces()
+        if workspace_pool is not None:
+            self._bind_workspace_pool(workspace_pool)
+        if self.workspace_pool is None:
+            raise RuntimeError("CKV prefetch registry has no persistent workspace pool")
+        identity = _ckv_workspace_identity(workspace)
+        state = self.states.get(identity)
+        if state is None:
+            # A resized view may retain its address, while an allocation
+            # replacement changes it. A known layer cache identifies the same
+            # execution lane across the latter without merging target/draft.
+            stale_identities = [
+                existing
+                for existing, existing_state in self.states.items()
+                if (
+                    existing.device == identity.device
+                    and existing.data_ptr == identity.data_ptr
+                )
+                or (
+                    layer_idx is not None
+                    and kv_cache is not None
+                    and layer_idx < len(existing_state.layer_caches)
+                    and existing_state.layer_caches[layer_idx] is kv_cache
+                )
+            ]
+            self._retire(stale_identities)
+            state = _CKVPrefetchState(identity, workspace, self.workspace_pool)
+            self.states[identity] = state
+        return state
 
 
 def _dcp_all_gather_current_stream(
@@ -538,6 +864,7 @@ class B12xMLASparseMetadata(AttentionMetadata):
     dcp_local_total_tokens: int = 0
     dcp_padded_total_tokens: int = 0
     dcp_ckv_gather_eligible: bool = False
+    ckv_prefetch_registry: _CKVPrefetchStateRegistry | None = None
 
     block_size: int = 64
     topk_tokens: int = 2048
@@ -652,6 +979,9 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
                 / (1024 * 1024),
             )
 
+        self.ckv_prefetch_registry = (
+            _CKVPrefetchStateRegistry() if ckv_gather_requested else None
+        )
         # Max-batched-token scratch buffers so cudagraph capture sees stable
         # allocations (sliced per build()).
         self.cache_seq_lens_per_token_buffer = torch.empty(
@@ -761,16 +1091,8 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
 
         from vllm import envs as envs_mod
 
-        if envs_mod.VLLM_B12X_MLA_CKV_GATHER:
-            # Reset the cross-layer prefetch pipeline once per step so the
-            # first layer always sync-gathers. The event/buf-idx are class
-            # state that would otherwise leak across chunks (the last layer
-            # of a chunk consumes but never re-arms), scheduling layer 0
-            # of subsequent chunks onto a stale gathered buffer. The
-            # layer->cache registry is intentionally left intact (stable
-            # cache pointers across chunks).
-            B12xMLASparseImpl._shared_gather_event = None
-            B12xMLASparseImpl._shared_gather_buf_idx = 0
+        if self.ckv_prefetch_registry is not None:
+            self.ckv_prefetch_registry.begin_step()
 
         if (
             use_dcp
@@ -982,6 +1304,7 @@ class B12xMLASparseMetadataBuilder(AttentionMetadataBuilder[B12xMLASparseMetadat
             dcp_local_total_tokens=dcp_local_total_tokens,
             dcp_padded_total_tokens=dcp_padded_total_tokens,
             dcp_ckv_gather_eligible=dcp_ckv_gather_eligible,
+            ckv_prefetch_registry=self.ckv_prefetch_registry,
             block_size=self.kv_cache_spec.block_size,
             topk_tokens=self.topk_tokens,
             bq4_ids=self.bq4_ids,
@@ -1046,7 +1369,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._kv_fp8_rope = bool(
             self.kv_cache_dtype == "nvfp4_ds_mla" and _kv_fp8_rope_enabled()
         )
-        if _KV_FP8_ROPE_REQUESTED and not _is_glm_moe_dsa_model():
+        if KV_FP8_ROPE_REQUESTED and not _is_glm_moe_dsa_model():
             logger.warning(
                 "KV_FP8_ROPE=1 ignored: compact MLA records are restricted to "
                 "model_type=glm_moe_dsa and its associated MTP draft"
@@ -1059,16 +1382,37 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
         if self._kv_fp8_rope:
             try:
-                from sparkinfer.attention._shared.mla.kv_cache import (
+                from b12x.attention._shared.mla.kv_cache import (
                     concat_and_cache_nvfp4_mla_fp8_rope,
                 )
             except ImportError as exc:
                 raise RuntimeError(
-                    "KV_FP8_ROPE=1 requires a SparkInfer build with "
+                    "KV_FP8_ROPE=1 requires a B12X build with "
                     "concat_and_cache_nvfp4_mla_fp8_rope package API support"
                 ) from exc
             self._concat_and_cache_nvfp4_mla_fp8_rope = (
                 concat_and_cache_nvfp4_mla_fp8_rope
+            )
+        self._nvfp4_dynamic_scale = bool(
+            self._kv_fp8_rope and NVFP4_DYNAMIC_SCALE_REQUESTED
+        )
+        if NVFP4_DYNAMIC_SCALE_REQUESTED and not self._kv_fp8_rope:
+            raise RuntimeError(
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 requires the 368-byte "
+                "KV_FP8_ROPE=1 nvfp4_ds_mla record (got kv_cache_dtype="
+                f"{self.kv_cache_dtype!r}, KV_FP8_ROPE="
+                f"{'1' if _kv_fp8_rope_enabled() else '0'})"
+            )
+        if self._nvfp4_dynamic_scale:
+            _require_callable_parameters(
+                "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 writer",
+                (
+                    (
+                        "concat_and_cache_nvfp4_mla_fp8_rope",
+                        self._concat_and_cache_nvfp4_mla_fp8_rope,
+                    ),
+                ),
+                frozenset({"per_token_scale"}),
             )
 
         # MLA dims (absorbed: Q post-projection is [T, H, kv_lora_rank + rope]).
@@ -1201,17 +1545,17 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         self._max_batched = int(max_batched)
 
-        # Lazily import SparkInfer only on this opt-in path.
-        from sparkinfer.attention.sparse_mla import (
+        # Lazily import B12X only on this opt-in path.
+        from b12x.attention.sparse_mla import (
             Caps as B12XSparseMLAScratchCaps,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             plan as plan_sparse_mla_scratch,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             run_decode as sparse_mla_decode_forward,
         )
-        from sparkinfer.attention.sparse_mla import (
+        from b12x.attention.sparse_mla import (
             run_extend as sparse_mla_extend_forward,
         )
 
@@ -1220,20 +1564,16 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         if self._b12x_scale_format is not None:
             required_kwargs = {"latent_scale", "scale_format"}
-            unsupported_forwards = [
-                mode
-                for mode, forward in (
+            if self._nvfp4_dynamic_scale:
+                required_kwargs = required_kwargs | {"latent_scale_per_token"}
+            _require_callable_parameters(
+                "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla'",
+                (
                     ("decode", sparse_mla_decode_forward),
                     ("extend", sparse_mla_extend_forward),
-                )
-                if not required_kwargs.issubset(inspect.signature(forward).parameters)
-            ]
-            if unsupported_forwards:
-                raise RuntimeError(
-                    "B12X_MLA_SPARSE with kv_cache_dtype='nvfp4_ds_mla' "
-                    "requires a b12x build with NVFP4 sparse-MLA API support; "
-                    "unsupported forwards: " + ", ".join(unsupported_forwards)
-                )
+                ),
+                frozenset(required_kwargs),
+            )
 
         # Eager PLAN -> BIND -> KERNEL (no b12x workspace/arena, ever). We build a
         # caller-owned-scratch PLAN once per mode; each forward maps a vLLM
@@ -1281,30 +1621,6 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             int(self._extend_plan.layout.nbytes),
         )
 
-        # Pre-touch q-concat + the attention scratch TOGETHER so the workspace
-        # manager grows during warmup (before lock_workspace() runs
-        # post-cudagraph-capture) and so the two always come from ONE
-        # get_simultaneous call -> distinct, non-overlapping offsets. The manager
-        # packs every call from offset 0, so borrowing q and the scratch the kernel
-        # writes in separate calls would alias them.
-        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
-            (
-                (max_batched, self._kernel_num_heads, self.q_head_dim),
-                torch.bfloat16,
-            )
-        ]
-        if self._pad_heads:
-            workspace_specs.append(
-                (
-                    (max_batched, self._input_num_heads, self.kv_lora_rank),
-                    torch.bfloat16,
-                )
-            )
-        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
-        self._workspace_specs = tuple(workspace_specs)
-        self._borrow_workspaces()
-        self._prewarm_extend_kernels_once(max_batched)
-
         # CKV gather setup (Fix B).
         from vllm import envs as envs_mod
 
@@ -1325,6 +1641,26 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         self._ckv_kernel_num_heads = self.num_heads
         self._ckv_gather_max_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS
         self._ckv_gather_min_tokens = envs_mod.VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS
+        configured_prefetch_depth = int(envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_DEPTH)
+        configured_prefetch_workspace_mib = int(
+            envs_mod.VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB
+        )
+        if configured_prefetch_depth < 0:
+            logger.warning_once(
+                "Ignoring negative VLLM_B12X_MLA_CKV_PREFETCH_DEPTH=%d; using 0",
+                configured_prefetch_depth,
+            )
+        if configured_prefetch_workspace_mib < 0:
+            logger.warning_once(
+                "Ignoring negative VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB=%d; "
+                "using 0 (unlimited)",
+                configured_prefetch_workspace_mib,
+            )
+            configured_prefetch_workspace_mib = 0
+        self._ckv_prefetch_supported = (
+            self._ckv_gather_enabled
+            and _ckv_prefetch_supports_format(self.kv_cache_dtype)
+        )
         self._ckv_local_capacity = (
             _cdiv(
                 _cdiv(self._ckv_gather_max_tokens, max(1, self.dcp_world_size))
@@ -1333,19 +1669,56 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
             * self.block_size
         )
+        requested_prefetch_depth = (
+            max(0, configured_prefetch_depth) if self._ckv_prefetch_supported else 0
+        )
+        workspace_budget_bytes = configured_prefetch_workspace_mib * 1024 * 1024
+        self._ckv_prefetch_depth = _ckv_prefetch_depth_within_budget(
+            requested_prefetch_depth,
+            workspace_budget_bytes,
+            self.dcp_world_size,
+            self._ckv_local_capacity,
+            self._kv_record_bytes,
+        )
+        self._ckv_workspace_slots = _ckv_prefetch_ring_slots(self._ckv_prefetch_depth)
         self._ckv_workspace_nbytes = (
-            2
-            * (self.dcp_world_size + 1)
-            * self._ckv_local_capacity
-            * self._kv_record_bytes
+            _ckv_prefetch_workspace_nbytes(
+                self._ckv_prefetch_depth,
+                self.dcp_world_size,
+                self._ckv_local_capacity,
+                self._kv_record_bytes,
+            )
             if self._ckv_gather_enabled
             else 0
         )
-        self._ckv_workspace = (
-            _get_ckv_gather_workspace(self.device, self._ckv_workspace_nbytes)
+        execution_lanes = _ckv_prefetch_execution_lanes(
+            parallel_config.num_ubatches,
+            spec is not None,
+        )
+        self._ckv_workspace_pool = (
+            _get_ckv_prefetch_workspace_pool(
+                self.device,
+                self._ckv_workspace_nbytes,
+                execution_lanes,
+            )
             if self._ckv_gather_enabled
             else None
         )
+        if self._ckv_workspace_pool is not None:
+            logger.info_once(
+                "Preallocated %.1f MiB for %d persistent CKV execution lane(s)",
+                self._ckv_workspace_pool.storage.numel() / (1024 * 1024),
+                self._ckv_workspace_pool.max_slots,
+            )
+        if self._ckv_prefetch_depth < requested_prefetch_depth:
+            logger.info_once(
+                "Capping native CKV prefetch depth from %d to %d to fit the "
+                "%d MiB per-lane workspace budget (actual %.1f MiB).",
+                requested_prefetch_depth,
+                self._ckv_prefetch_depth,
+                configured_prefetch_workspace_mib,
+                self._ckv_workspace_nbytes / (1024 * 1024),
+            )
 
         # Separate extend plan for the gathered-cache path: full local heads
         # (no head all-gather), global seq lens.
@@ -1360,19 +1733,34 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         else:
             self._ckv_extend_plan = None
 
-        # Layer prefetch (side stream + events + ping-pong).
-        # _shared_* are class-level: layer L kicks off the prefetch for
-        # layer L+1, and layer L+1 (a different impl instance) consumes it.
-        self._ckv_prefetch_supported = self._ckv_gather_enabled and (
-            self.kv_cache_dtype == "fp8_ds_mla" or self._kv_fp8_rope
-        )
+        # Pre-touch q-concat and attention scratch together. Cross-layer CKV
+        # data cannot live in WorkspaceManager: every caller borrows from
+        # offset zero, so intervening indexer/MoE scratch would alias it. The
+        # builder-owned state allocates a dedicated ring per workspace lane.
+        workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
+            (
+                (max_batched, self._kernel_num_heads, self.q_head_dim),
+                torch.bfloat16,
+            )
+        ]
+        if self._pad_heads:
+            workspace_specs.append(
+                (
+                    (max_batched, self._input_num_heads, self.kv_lora_rank),
+                    torch.bfloat16,
+                )
+            )
+        workspace_specs.append(((self._scratch_nbytes,), torch.uint8))
+        self._workspace_specs = tuple(workspace_specs)
+        self._borrow_workspaces()
+        self._prewarm_extend_kernels_once(max_batched)
+
+        # The builder-owned registry lazily creates one stream per workspace
+        # lane after cache discovery finds the first lookahead target. CUDA
+        # capture keeps the existing non-CKV fallback.
         if self._ckv_gather_enabled:
-            self._ckv_gather_stream = torch.cuda.Stream(device=self.device)
             self._ckv_current_chunk_kv_c: torch.Tensor | None = None
             self._ckv_current_chunk_kpe: torch.Tensor | None = None
-            B12xMLASparseImpl._all_layer_kv_caches: list[torch.Tensor | None] = []
-            B12xMLASparseImpl._shared_gather_event: torch.cuda.Event | None = None
-            B12xMLASparseImpl._shared_gather_buf_idx = 0
             if not self._ckv_prefetch_supported:
                 logger.warning_once(
                     "CKV gather prefetch disabled for kv_cache_dtype=%s "
@@ -1380,8 +1768,14 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     self.kv_cache_dtype,
                     int(self._kv_fp8_rope),
                 )
+            elif self._ckv_prefetch_depth > 0:
+                logger.info_once(
+                    "Using native CKV layer prefetch with depth=%d and "
+                    "%d workspace slots.",
+                    self._ckv_prefetch_depth,
+                    self._ckv_workspace_slots,
+                )
         else:
-            self._ckv_gather_stream = None
             self._ckv_current_chunk_kv_c = None
             self._ckv_current_chunk_kpe = None
 
@@ -1406,6 +1800,8 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         cls._all_layer_kv_caches = []
         cls._shared_gather_event = None
         cls._shared_gather_buf_idx = 0
+        for registry in tuple(_CKV_PREFETCH_STATE_REGISTRIES):
+            registry.clear()
 
     def do_kv_cache_update(
         self,
@@ -1439,13 +1835,25 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 f"KV_FP8_ROPE writer reached a non-NVFP4 cache: {kv_cache_dtype!r}"
             )
         k_pe_flat = k_pe.squeeze(1)
-        self._concat_and_cache_nvfp4_mla_fp8_rope(
-            kv_c_normed,
-            k_pe_flat,
-            kv_cache,
-            slot_mapping.flatten(),
-            k_scale,
-        )
+        if self._nvfp4_dynamic_scale:
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c_normed,
+                k_pe_flat,
+                kv_cache,
+                slot_mapping.flatten(),
+                k_scale,
+                per_token_scale=True,
+            )
+        else:
+            # Keyword omitted so pre-two-level B12X builds keep working
+            # when the mode is off.
+            self._concat_and_cache_nvfp4_mla_fp8_rope(
+                kv_c_normed,
+                k_pe_flat,
+                kv_cache,
+                slot_mapping.flatten(),
+                k_scale,
+            )
 
     def _borrow_workspaces(self) -> list[torch.Tensor]:
         workspaces = current_workspace_manager().get_simultaneous(
@@ -1691,7 +2099,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         """Project DCP partials from 512 to 256 in borrowed MLA storage."""
         num_tokens = int(attn_out.shape[0])
         self._validate_dcp_prefill_workspace_contract(num_tokens)
-        # SparkInfer's head-major extend output is planned for the configured
+        # B12X's head-major extend output is planned for the configured
         # token capacity, even when the gathered head count needs no padding.
         # A shorter prefill chunk is therefore a pitched view of that allocation.
         # It is safe here because the input is compacted before entering cuBLAS.
@@ -1797,6 +2205,27 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         ):
             raise RuntimeError("B12X CKV gather borrowed an invalid workspace")
 
+    def _ckv_workspace_views(
+        self, ckv_workspace: torch.Tensor, buf_idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        self._validate_ckv_workspace(ckv_workspace)
+        if not 0 <= int(buf_idx) < self._ckv_workspace_slots:
+            raise ValueError(
+                f"CKV gather buffer index {buf_idx} is outside "
+                f"[0, {self._ckv_workspace_slots})"
+            )
+        records = ckv_workspace.view(-1, self._kv_record_bytes)
+        local_buffer = records[: self._ckv_local_capacity]
+        gathered_base = (
+            self._ckv_local_capacity
+            + buf_idx * self.dcp_world_size * self._ckv_local_capacity
+        )
+        gathered_buffer = records[
+            gathered_base : gathered_base
+            + self.dcp_world_size * self._ckv_local_capacity
+        ]
+        return local_buffer, gathered_buffer
+
     def dcp_prefill_ckv_gather_eligible(
         self,
         attn_metadata: B12xMLASparseMetadata,
@@ -1854,18 +2283,11 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         assert attn_metadata.dcp_local_cu_seq_lens is not None
         padded_tokens = attn_metadata.dcp_padded_total_tokens
         local_tokens = attn_metadata.dcp_local_total_tokens
-        self._validate_ckv_workspace(ckv_workspace)
-        half_nbytes = (
-            (self.dcp_world_size + 1) * self._ckv_local_capacity * self._kv_record_bytes
+        local_buffer, gathered_buffer = self._ckv_workspace_views(
+            ckv_workspace, buf_idx
         )
-        ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
-        base = buf_idx * (half_nbytes // self._kv_record_bytes)
-        local_buffer = ws_half[base : base + self._ckv_local_capacity]
-        gathered_buffer = ws_half[
-            base + self._ckv_local_capacity : base
-            + self._ckv_local_capacity * (self.dcp_world_size + 1)
-        ]
         if stream is not None:
+            ckv_workspace.record_stream(stream)
             # The side stream must observe the default stream's prior writes
             # to the paged KV cache (this and earlier steps' do_kv_cache_update)
             # before gathering history off it; there is otherwise no ordering
@@ -2007,14 +2429,24 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
 
         k_scale = getattr(layer, "_k_scale", None)
         if self._kv_fp8_rope:
-            self._concat_and_cache_nvfp4_mla_fp8_rope(
-                kv_c,
-                k_pe_flat,
-                gathered_buffer,
-                slots,
-                k_scale,
-            )
-        elif self.kv_cache_dtype == "fp8_ds_mla":
+            if self._nvfp4_dynamic_scale:
+                self._concat_and_cache_nvfp4_mla_fp8_rope(
+                    kv_c,
+                    k_pe_flat,
+                    gathered_buffer,
+                    slots,
+                    k_scale,
+                    per_token_scale=True,
+                )
+            else:
+                self._concat_and_cache_nvfp4_mla_fp8_rope(
+                    kv_c,
+                    k_pe_flat,
+                    gathered_buffer,
+                    slots,
+                    k_scale,
+                )
+        elif self.kv_cache_dtype in ("fp8_ds_mla", "nvfp4_ds_mla"):
             ops.concat_and_cache_mla(
                 kv_c,
                 k_pe_flat,
@@ -2027,7 +2459,7 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             raise RuntimeError(
                 "CKV gather prefetch append is not yet supported for "
                 f"kv_cache_dtype={self.kv_cache_dtype!r}; disable prefetch "
-                "or use fp8_ds_mla / KV_FP8_ROPE."
+                "or use fp8_ds_mla / nvfp4_ds_mla."
             )
 
     def _sync_warmup(self) -> None:
@@ -2048,6 +2480,18 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
     def _b12x_kernel_format_kwargs(self, latent_scale: float = 1.0) -> dict[str, Any]:
         if self._b12x_scale_format is None:
             return {}
+        if self._nvfp4_dynamic_scale:
+            if float(latent_scale) != 1.0:
+                raise RuntimeError(
+                    "VLLM_NVFP4_MLA_DYNAMIC_SCALE=1 is mutually exclusive with "
+                    "a per-layer outer scale (got latent_scale="
+                    f"{latent_scale!r}); unset VLLM_NVFP4_MLA_SCALES_FILE"
+                )
+            return {
+                "latent_scale": 1.0,
+                "scale_format": self._b12x_scale_format,
+                "latent_scale_per_token": True,
+            }
         return {
             "latent_scale": float(latent_scale),
             "scale_format": self._b12x_scale_format,
@@ -2241,7 +2685,6 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
         workspace_tensors = self._borrow_workspaces()
         q_workspace = workspace_tensors[0]
         dense_out_workspace = workspace_tensors[1] if self._pad_heads else None
-        ckv_workspace = self._ckv_workspace
         scratch_storage = workspace_tensors[-1]
         expected_input_heads = (
             self.num_heads if use_ckv_gather else self._input_num_heads
@@ -2401,28 +2844,33 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                 f"got stride={tuple(kv_cache.stride())}"
             )
         if use_ckv_gather:
-            if ckv_workspace is None:
-                raise RuntimeError("CKV gather workspace was not borrowed")
             layer_idx = self._resolve_layer_index(layer)
-            if layer_idx is not None:
-                while len(B12xMLASparseImpl._all_layer_kv_caches) <= layer_idx:
-                    B12xMLASparseImpl._all_layer_kv_caches.append(None)
-                B12xMLASparseImpl._all_layer_kv_caches[layer_idx] = kv_cache
-            if B12xMLASparseImpl._shared_gather_event is not None:
-                B12xMLASparseImpl._shared_gather_event.wait()
-                half_nbytes = (
-                    (self.dcp_world_size + 1)
-                    * self._ckv_local_capacity
-                    * self._kv_record_bytes
+            prefetch_registry = attn_metadata.ckv_prefetch_registry
+            if prefetch_registry is None:
+                raise RuntimeError("CKV gather requires a prefetch state registry")
+            if self._ckv_workspace_pool is None:
+                raise RuntimeError("CKV gather requires a persistent workspace pool")
+            prefetch_state = prefetch_registry.for_workspace(
+                q_workspace,
+                layer_idx,
+                kv_cache,
+                workspace_pool=self._ckv_workspace_pool,
+            )
+            ckv_workspace = prefetch_state.get_ckv_workspace(self._ckv_workspace_nbytes)
+            if layer_idx is not None and self._ckv_prefetch_depth > 0:
+                prefetch_state.enter_layer(layer_idx)
+                prefetch_state.register_cache(layer_idx, kv_cache)
+            pending = (
+                prefetch_state.pending_layers.pop(layer_idx, None)
+                if layer_idx is not None and self._ckv_prefetch_depth > 0
+                else None
+            )
+            if pending is not None:
+                gather_event, current_buf_idx = pending
+                gather_event.wait()
+                _, gathered_buffer = self._ckv_workspace_views(
+                    ckv_workspace, current_buf_idx
                 )
-                ws_half = ckv_workspace.view(-1, self._kv_record_bytes)
-                base = B12xMLASparseImpl._shared_gather_buf_idx * (
-                    half_nbytes // self._kv_record_bytes
-                )
-                gathered_buffer = ws_half[
-                    base + self._ckv_local_capacity : base
-                    + self._ckv_local_capacity * (self.dcp_world_size + 1)
-                ]
                 kv_cache = gathered_buffer[
                     : self.dcp_world_size * self._ckv_local_capacity
                 ].view(-1, self.block_size, self._kv_record_bytes)
@@ -2430,7 +2878,22 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
                     kv_cache, attn_metadata, layer, num_actual_toks
                 )
             else:
-                kv_cache = self._dcp_gather_ckv(kv_cache, attn_metadata, ckv_workspace)
+                # The ring shares one local staging region across gathered
+                # slots. An irregular fallback can occur while a future layer
+                # is pending, so order this main-stream write after all current
+                # side-stream users without increasing the persistent pool.
+                prefetch_state.wait_for_pending_writes()
+                current_buf_idx = (
+                    layer_idx % self._ckv_workspace_slots
+                    if layer_idx is not None
+                    else 0
+                )
+                kv_cache = self._dcp_gather_ckv(
+                    kv_cache,
+                    attn_metadata,
+                    ckv_workspace,
+                    buf_idx=current_buf_idx,
+                )
             logger.info_once(
                 "Using transient full-CKV gather for B12X sparse MLA prefill "
                 "(capacity=%d logical tokens)",
@@ -2438,24 +2901,39 @@ class B12xMLASparseImpl(MLAAttentionImpl[B12xMLASparseMetadata]):
             )
             if (
                 self._ckv_prefetch_supported
+                and self._ckv_prefetch_depth > 0
                 and layer_idx is not None
-                and layer_idx + 1 < len(B12xMLASparseImpl._all_layer_kv_caches)
-                and B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1] is not None
             ):
-                next_kv = B12xMLASparseImpl._all_layer_kv_caches[layer_idx + 1]
-                next_buf_idx = 1 - B12xMLASparseImpl._shared_gather_buf_idx
-                self._dcp_gather_ckv(
-                    next_kv,
-                    attn_metadata,
-                    ckv_workspace,
-                    buf_idx=next_buf_idx,
-                    stream=self._ckv_gather_stream,
+                # The first eligible request only discovers one layer cache at
+                # a time. It intentionally has no lookahead and primes the
+                # cache registry for subsequent requests.
+                targets = _ckv_prefetch_target_indices(
+                    layer_idx,
+                    self._ckv_prefetch_depth,
+                    prefetch_state.layer_caches,
+                    prefetch_state.pending_layers,
                 )
-                B12xMLASparseImpl._shared_gather_event = torch.cuda.Event(
-                    blocking=False
+                prefetch_stream = (
+                    prefetch_state.get_gather_stream() if targets else None
                 )
-                B12xMLASparseImpl._shared_gather_event.record(self._ckv_gather_stream)
-                B12xMLASparseImpl._shared_gather_buf_idx = next_buf_idx
+                for target_idx in targets:
+                    assert prefetch_stream is not None
+                    target_kv = prefetch_state.layer_caches[target_idx]
+                    assert target_kv is not None
+                    target_buf_idx = target_idx % self._ckv_workspace_slots
+                    self._dcp_gather_ckv(
+                        target_kv,
+                        attn_metadata,
+                        ckv_workspace,
+                        buf_idx=target_buf_idx,
+                        stream=prefetch_stream,
+                    )
+                    target_event = torch.cuda.Event(blocking=False)
+                    target_event.record(prefetch_stream)
+                    prefetch_state.pending_layers[target_idx] = (
+                        target_event,
+                        target_buf_idx,
+                    )
 
         use_spec_decode_kernel = self.spec_extend_as_decode and (
             self.spec_extend_as_decode_force or attn_metadata.is_spec_decode

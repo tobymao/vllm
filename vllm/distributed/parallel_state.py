@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream
+    channel_id: str | None = None
 
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
@@ -620,7 +621,10 @@ class GroupCoordinator:
             )
             ca_comm = self.device_communicator.ca_comm
             if ca_comm is not None:
-                maybe_ca_context = ca_comm.capture(stream=stream)  # type: ignore
+                maybe_ca_context = ca_comm.capture(  # type: ignore
+                    stream=stream,
+                    channel_id=graph_capture_context.channel_id,
+                )
 
             from vllm._aiter_ops import rocm_aiter_ops
 
@@ -758,9 +762,7 @@ class GroupCoordinator:
     ) -> torch.Tensor:
         """Reduce-scatter and preserve a physically head-major output view."""
         if self.world_size <= 1 or dim != 1:
-            raise RuntimeError(
-                "reduce_scatter_head_major requires DCP heads on dim 1"
-            )
+            raise RuntimeError("reduce_scatter_head_major requires DCP heads on dim 1")
         if self.device_communicator is None:
             raise RuntimeError(
                 "reduce_scatter_head_major requires a device communicator"
@@ -1447,6 +1449,103 @@ def get_query_split_group() -> GroupCoordinator:
     return _QUERY_SPLIT
 
 
+_INDEXER_DCP: GroupCoordinator | None = None
+
+
+def get_indexer_dcp_group(
+    expected_world_size: int | None = None,
+) -> GroupCoordinator:
+    """Return the group matching an indexer's actual KV shard count.
+
+    A partially replicated target indexer and a fully sharded speculative
+    indexer can coexist in the same model. Callers that know their shard count
+    must provide it so the speculative indexer does not inherit the target's
+    smaller process group.
+    """
+    if expected_world_size is None:
+        return _INDEXER_DCP if _INDEXER_DCP is not None else get_dcp_group()
+
+    if _INDEXER_DCP is not None and int(_INDEXER_DCP.world_size) == expected_world_size:
+        return _INDEXER_DCP
+
+    dcp_group = get_dcp_group()
+    if int(dcp_group.world_size) == expected_world_size:
+        return dcp_group
+
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
+    raise RuntimeError(
+        "No sparse-indexer DCP group matches the requested KV shard count: "
+        f"requested={expected_world_size}, partial={partial_size}, "
+        f"configured={dcp_group.world_size}"
+    )
+
+
+_INDEXER_QUERY_SPLIT: GroupCoordinator | None = None
+
+
+def get_indexer_query_split_group(
+    indexer_dcp_world_size: int | None = None,
+) -> GroupCoordinator:
+    """Return the query-split group paired with an indexer's shard group."""
+    if indexer_dcp_world_size is None:
+        if _INDEXER_QUERY_SPLIT is not None:
+            return _INDEXER_QUERY_SPLIT
+        return get_query_split_group()
+
+    if (
+        _INDEXER_DCP is not None
+        and int(_INDEXER_DCP.world_size) == indexer_dcp_world_size
+    ):
+        if _INDEXER_QUERY_SPLIT is None:
+            raise RuntimeError("Partial indexer DCP group has no query-split group")
+        return _INDEXER_QUERY_SPLIT
+
+    dcp_group = get_dcp_group()
+    if int(dcp_group.world_size) == indexer_dcp_world_size:
+        return get_query_split_group()
+
+    partial_size = int(_INDEXER_DCP.world_size) if _INDEXER_DCP is not None else None
+    raise RuntimeError(
+        "No indexer query-split group matches the requested KV shard count: "
+        f"requested={indexer_dcp_world_size}, partial={partial_size}, "
+        f"configured={dcp_group.world_size}"
+    )
+
+
+def _build_indexer_replica_group_ranks(
+    tp_group_ranks: list[list[int]], indexer_shards: int
+) -> tuple[list[list[int]], list[list[int]]]:
+    """Build shard-owner groups and cross-replica query-split groups."""
+    dcp_groups: list[list[int]] = []
+    query_split_groups: list[list[int]] = []
+    for tp_ranks in tp_group_ranks:
+        if indexer_shards <= 0 or len(tp_ranks) % indexer_shards != 0:
+            raise ValueError(
+                f"Indexer shards={indexer_shards} must divide TP={len(tp_ranks)}"
+            )
+        replicas = [
+            tp_ranks[start : start + indexer_shards]
+            for start in range(0, len(tp_ranks), indexer_shards)
+        ]
+        dcp_groups.extend(replicas)
+        query_split_groups.extend(
+            [replica[shard_rank] for replica in replicas]
+            for shard_rank in range(indexer_shards)
+        )
+    return dcp_groups, query_split_groups
+
+
+def _validate_indexer_shard_count(indexer_shards: int, dcp_size: int) -> None:
+    """Reject partial-indexer layouts that cannot form equal replica groups."""
+    if indexer_shards in (0, 1, dcp_size):
+        return
+    if indexer_shards < 1 or indexer_shards > dcp_size or dcp_size % indexer_shards:
+        raise ValueError(
+            "VLLM_DCP_INDEXER_SHARDS must be 0, 1, or a positive divisor of "
+            f"the configured DCP size; got shards={indexer_shards}, DCP={dcp_size}"
+        )
+
+
 _DCP_CKV_PREFETCH: GroupCoordinator | None = None
 
 
@@ -1464,7 +1563,7 @@ def get_pp_group() -> GroupCoordinator:
 
 
 def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any], ...]:
-    """Snapshot SparkInfer channels used by disposable graph captures."""
+    """Snapshot B12X channels used by disposable graph captures."""
     checkpoints: list[tuple[Callable[[Any], None], Any]] = []
     seen_communicators: set[int] = set()
     for group in (_TP, _DCP, _PP):
@@ -1499,7 +1598,7 @@ def checkpoint_b12x_graph_channels() -> tuple[tuple[Callable[[Any], None], Any],
 def rollback_b12x_graph_channels(
     checkpoints: tuple[tuple[Callable[[Any], None], Any], ...],
 ) -> None:
-    """Roll back SparkInfer channels after disposable graphs are destroyed."""
+    """Roll back B12X channels after disposable graphs are destroyed."""
     for rollback, checkpoint in reversed(checkpoints):
         rollback(checkpoint)
 
@@ -1548,6 +1647,8 @@ def get_pcp_group() -> GroupCoordinator:
 def graph_capture(
     device: torch.device,
     graph_capture_context: GraphCaptureContext | None = None,
+    *,
+    channel_id: str | None = None,
 ):
     """
     `graph_capture` is a context manager which should surround the code that
@@ -1564,10 +1665,25 @@ def graph_capture(
 
     A caller may pass an explicit ``graph_capture_context`` to control the
     stream used (e.g. to capture on the default stream).
+
+    ``channel_id`` identifies the graph semantically to distributed transports.
+    It must be stable and identical across ranks; CUDA stream handles are local
+    process state and are not valid distributed identities.
     """
-    context = graph_capture_context or GraphCaptureContext(
-        torch.cuda.Stream(device=device)
-    )
+    if graph_capture_context is None:
+        context = GraphCaptureContext(
+            torch.cuda.Stream(device=device),
+            channel_id=channel_id,
+        )
+    else:
+        context = graph_capture_context
+        if channel_id is not None:
+            if context.channel_id is not None and context.channel_id != channel_id:
+                raise ValueError(
+                    "graph capture context and argument specify different "
+                    "semantic channel IDs"
+                )
+            context.channel_id = channel_id
     maybe_dcp_capture = (
         get_dcp_group().graph_capture(context)
         if _DCP is not None and get_dcp_group().world_size > 1
@@ -1576,10 +1692,14 @@ def graph_capture(
     if _DCP is not None and get_dcp_group().world_size > 1:
         # Import locally to avoid making distributed initialization depend on
         # attention modules. The helper is a no-op until DCP warmup creates a
-        # SparkInfer pool for this process group.
+        # B12X pool for this process group.
         from vllm.v1.attention.ops.dcp_alltoall import capture_b12x_dcp_a2a
 
-        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(get_dcp_group(), context.stream)
+        maybe_b12x_dcp_capture = capture_b12x_dcp_a2a(
+            get_dcp_group(),
+            context.stream,
+            channel_id=context.channel_id,
+        )
     else:
         maybe_b12x_dcp_capture = nullcontext()
     with (
@@ -1946,6 +2066,7 @@ def initialize_model_parallel(
     if enable_elastic_ep:
         group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
         group_ranks = [x.tolist() for x in group_ranks]
+    tp_group_ranks = group_ranks
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
         group_ranks,
@@ -1977,23 +2098,51 @@ def initialize_model_parallel(
         group_name="dcp",
     )
 
-    # Build the query-split groups for the indexer query split (Fix A).
-    # Ranks sharing the same dcp_rank (position within their DCP group)
-    # form a query-split group.  At TP=8/DCP=2 the DCP groups are
-    # {0,1},{2,3},{4,5},{6,7} and the query-split groups are
-    # {0,2,4,6} (dcp_rank=0) and {1,3,5,7} (dcp_rank=1).
+    # Build the full-indexer query-split groups from the same topology helper
+    # used by partially replicated indexers below. At TP8/DCP2 this produces
+    # {0,2,4,6}/{1,3,5,7}. DCP1 intentionally produces one TP-wide group:
+    # every rank has the replicated indexer inputs and can process a query-row
+    # shard before restoring the exact int32 top-k indices.
     global _QUERY_SPLIT
     assert _QUERY_SPLIT is None, "query split group is already initialized"
-    if decode_context_model_parallel_size > 1 and envs.VLLM_DCP_QUERY_SPLIT:
-        query_split_ranks: list[list[int]] = []
-        for dcp_rank_idx in range(decode_context_model_parallel_size):
-            query_split_ranks.append([grp[dcp_rank_idx] for grp in group_ranks])
+    if envs.VLLM_DCP_QUERY_SPLIT:
+        _, query_split_ranks = _build_indexer_replica_group_ranks(
+            tp_group_ranks, decode_context_model_parallel_size
+        )
         _QUERY_SPLIT = init_model_parallel_group(
             query_split_ranks,
             get_world_group().local_rank,
             backend,
             group_name="query_split",
         )
+
+    # A partially replicated sparse-indexer cache has its own shard topology.
+    # With TP8/DCP8 and four indexer shards, these are {0,1,2,3}/{4,5,6,7};
+    # ranks at the same position form two-way query-split groups.
+    global _INDEXER_DCP, _INDEXER_QUERY_SPLIT
+    assert _INDEXER_DCP is None, "indexer DCP group is already initialized"
+    assert _INDEXER_QUERY_SPLIT is None, (
+        "indexer query split group is already initialized"
+    )
+    indexer_shards = int(envs.VLLM_DCP_INDEXER_SHARDS)
+    _validate_indexer_shard_count(indexer_shards, decode_context_model_parallel_size)
+    if 1 < indexer_shards < decode_context_model_parallel_size:
+        indexer_dcp_ranks, indexer_query_split_ranks = (
+            _build_indexer_replica_group_ranks(tp_group_ranks, indexer_shards)
+        )
+        _INDEXER_DCP = init_model_parallel_group(
+            indexer_dcp_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="indexer_dcp",
+        )
+        if envs.VLLM_DCP_QUERY_SPLIT:
+            _INDEXER_QUERY_SPLIT = init_model_parallel_group(
+                indexer_query_split_ranks,
+                get_world_group().local_rank,
+                backend,
+                group_name="indexer_query_split",
+            )
 
     # A dedicated communicator over the DCP ranks for the transient ckv
     # prefetch gather (Fix B). The prefetch runs on a side stream and would
@@ -2239,6 +2388,16 @@ def destroy_model_parallel():
     if _QUERY_SPLIT:
         _QUERY_SPLIT.destroy()
     _QUERY_SPLIT = None
+
+    global _INDEXER_DCP
+    if _INDEXER_DCP:
+        _INDEXER_DCP.destroy()
+    _INDEXER_DCP = None
+
+    global _INDEXER_QUERY_SPLIT
+    if _INDEXER_QUERY_SPLIT:
+        _INDEXER_QUERY_SPLIT.destroy()
+    _INDEXER_QUERY_SPLIT = None
 
     global _DCP_CKV_PREFETCH
     if _DCP_CKV_PREFETCH:

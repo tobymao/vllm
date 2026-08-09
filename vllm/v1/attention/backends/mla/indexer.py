@@ -8,7 +8,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
-from vllm.distributed import get_dcp_group
+from vllm.distributed import get_indexer_dcp_group
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -30,8 +30,11 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import AttentionSpec, MLAAttentionSpec
-from vllm.v1.worker.cp_utils import get_total_cp_world_size
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    MLAAttentionSpec,
+    get_kv_cache_cp_shard_count,
+)
 
 logger = init_logger(__name__)
 
@@ -280,12 +283,30 @@ def get_max_prefill_buffer_size(vllm_config: VllmConfig):
     return max_model_len * 40
 
 
-def _supports_varlen_paged_mqa_logits() -> bool:
-    if (
-        envs.VLLM_USE_B12X_SPARSE_INDEXER
-        and current_platform.is_cuda()
-        and current_platform.is_device_capability_family(120)
-    ):
+def get_indexer_max_num_blocks_per_req(
+    max_model_len: int,
+    block_size: int,
+    configured_cp_world_size: int,
+    dcp_replicated: bool,
+    dcp_kv_shard_count: int | None = None,
+) -> int:
+    """Size indexer metadata for the cache group's effective DCP layout."""
+    effective_cp_world_size = (
+        1 if dcp_replicated else int(dcp_kv_shard_count or configured_cp_world_size)
+    )
+    return cdiv(max_model_len, block_size * effective_cp_world_size)
+
+
+def _supports_varlen_paged_mqa_logits(
+    use_b12x_sparse_indexer: bool | None = None,
+) -> bool:
+    if use_b12x_sparse_indexer is None and current_platform.is_cuda():
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer as resolve_b12x_sparse_indexer,
+        )
+
+        use_b12x_sparse_indexer = resolve_b12x_sparse_indexer()
+    if use_b12x_sparse_indexer:
         # B12X consumes the already-flattened rank-1 seq_lens and repeated
         # block-table rows directly, so it does not need DeepGEMM's indices.
         return True
@@ -355,8 +376,26 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         super().__init__(*args, **kwargs)
         scheduler_config = self.vllm_config.scheduler_config
         parallel_config = self.vllm_config.parallel_config
-        self.dcp_world_size = parallel_config.decode_context_parallel_size
-        self.dcp_rank = get_dcp_group().rank_in_group if self.dcp_world_size > 1 else 0
+        self.dcp_replicated = bool(getattr(self.kv_cache_spec, "dcp_replicated", False))
+        configured_dcp_world_size = parallel_config.decode_context_parallel_size
+        configured_cp_world_size = (
+            configured_dcp_world_size * parallel_config.prefill_context_parallel_size
+        )
+        self.dcp_world_size = get_kv_cache_cp_shard_count(
+            self.kv_cache_spec,
+            configured_dcp_world_size,
+            parallel_config.prefill_context_parallel_size,
+        )
+        if self.dcp_world_size > 1:
+            indexer_group = get_indexer_dcp_group(self.dcp_world_size)
+            if int(indexer_group.world_size) != self.dcp_world_size:
+                raise RuntimeError(
+                    "Indexer metadata DCP group does not match its KV shard count: "
+                    f"group={indexer_group.world_size}, shards={self.dcp_world_size}"
+                )
+            self.dcp_rank = int(indexer_group.rank_in_group)
+        else:
+            self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         # The DCP sparse-indexer code is parameterized by interleave size, but
         # interleave > 1 is not yet validated end-to-end (gsm8k parity fails),
@@ -395,16 +434,30 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # caches). Outside the SM100 family the FP8
         # paged MQA logits kernel only supports next_n in (1, 2)
         # (deepgemm smxx_fp8_fp4_paged_mqa_logits.hpp:233), so flatten there.
-        self.use_flattening = not current_platform.is_device_capability_family(
-            100
-        ) and next_n not in (1, 2)
+        # The B12X sparse indexer handles native next_n>2 on SM120
+        # directly (see sparse_attn_indexer warmup q_rows 1, 2, 4), so it must
+        # NOT be forced onto the DeepGEMM next_n<=2 flatten fallback. Flattening
+        # MTP-2/MTP-3 verification into rank-1 rows produced subtly wrong accepted
+        # tokens (code-gen syntax errors); the native (B, next_n) path keeps MTP
+        # correct. Use the canonical backend-aware predicate so this also holds
+        # when B12X is selected via --attention-backend B12X_MLA_SPARSE with the
+        # VLLM_USE_B12X_SPARSE_INDEXER env var unset (it also asserts SM120).
+        from vllm.model_executor.layers.sparse_attn_indexer import (
+            use_b12x_sparse_indexer,
+        )
+
+        self.use_b12x_sparse_indexer = use_b12x_sparse_indexer()
+        self.use_flattening = (
+            not current_platform.is_device_capability_family(100)
+            and next_n not in (1, 2)
+            and not self.use_b12x_sparse_indexer
+        )
         # SM100 supports the varlen paged MQA logits kernel (indices-selected,
         # next_n == 1 rows). Only compact spec-decode verification batches opt
         # into it; uniform DFlash draft proposal should keep the native path.
-        self.use_varlen = (
-            _supports_varlen_paged_mqa_logits()
-            and _uses_varlen_dspark_capacity(self.vllm_config)
-        )
+        self.use_varlen = _supports_varlen_paged_mqa_logits(
+            self.use_b12x_sparse_indexer
+        ) and _uses_varlen_dspark_capacity(self.vllm_config)
         logger.info_once(
             "DSA indexer decode path: use_flattening=%s use_varlen=%s "
             "(next_n=%d, use_fp4_indexer_cache=%s)",
@@ -455,9 +508,12 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         # Best-effort width; the runner's actual block-table row length can
         # differ (kernel-block splitting, alignment padding), so
         # _expanded_block_table resizes on first use if needed.
-        max_num_blocks_per_req = cdiv(
+        max_num_blocks_per_req = get_indexer_max_num_blocks_per_req(
             self.vllm_config.model_config.max_model_len,
-            self.kv_cache_spec.block_size * get_total_cp_world_size(),
+            self.kv_cache_spec.block_size,
+            configured_cp_world_size,
+            self.dcp_replicated,
+            getattr(self.kv_cache_spec, "dcp_kv_shard_count", None),
         )
         # Keep the expanded decode table layout identical to the model
         # runner's block table. The runner right-pads rows to a 128-token
@@ -674,7 +730,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 # their slot mappings stay padded and their outputs are ignored.
                 padding_seq_len = (
                     self.compress_ratio
-                    if force_flatten and envs.VLLM_USE_B12X_SPARSE_INDEXER
+                    if force_flatten and self.use_b12x_sparse_indexer
                     else 0
                 )
                 self.decode_seq_lens_buffer[actual_expanded:num_decode_tokens] = (
@@ -804,7 +860,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         num_decode_tokens: int,
         requires_padding: bool,
     ) -> torch.Tensor | None:
-        if not envs.VLLM_USE_B12X_SPARSE_INDEXER or requires_padding:
+        if not self.use_b12x_sparse_indexer or requires_padding:
             return None
 
         schedule_seq_lens = seq_lens
@@ -816,10 +872,10 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
         if schedule_seq_lens.dim() != 1:
             return None
 
-        from sparkinfer.attention.nsa_indexer import (
+        from b12x.attention.nsa_indexer import (
             plan_paged_schedule as build_paged_mqa_schedule_metadata,
         )
-        from sparkinfer.attention.nsa_indexer import (
+        from b12x.attention.nsa_indexer import (
             uses_paged_schedule as uses_paged_mqa_schedule,
         )
 
@@ -967,7 +1023,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # slice below).
             assert common_attn_metadata.seq_lens_cpu_upper_bound is not None
             seq_lens_cpu = common_attn_metadata.seq_lens_cpu_upper_bound
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if self.use_b12x_sparse_indexer:
                 # The b12x paged prefill streams one supertile at a time and
                 # row-shares the page table, which requires single-request
                 # chunks. Budget each request by the supertile K window.
@@ -1039,7 +1095,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # range and miss valid tokens. Keep the global seq_lens here and
             # localize the expanded bounds further down.
             global_seq_lens_for_decode: torch.Tensor | None = None
-            if dcp_local_seq_lens is not None:
+            if use_dcp_local_kv:
                 global_seq_lens_for_decode = common_attn_metadata.seq_lens[:num_decodes]
             seq_lens = common_attn_metadata.seq_lens[:num_decodes]
             block_table = common_attn_metadata.block_table_tensor[:num_decodes, ...]
@@ -1103,7 +1159,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             # Uncompressed DCP localizes after per-token expansion. Compressed
             # DCP must first convert global logical lengths to compressed-token
             # lengths and only then shard those retained tokens across ranks.
-            if dcp_local_seq_lens is not None and self.compress_ratio == 1:
+            if use_dcp_local_kv and self.compress_ratio == 1:
                 seq_lens = self._dcp_localize_decode_seq_lens(
                     seq_lens, num_decodes, seq_lens_is_buffer_view
                 )
@@ -1113,7 +1169,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
             if self.compress_ratio > 1:
                 if seq_lens_is_buffer_view:
                     seq_lens //= self.compress_ratio
-                    if dcp_local_seq_lens is not None:
+                    if use_dcp_local_kv:
                         seq_lens.copy_(
                             get_dcp_local_seq_lens(
                                 seq_lens,
@@ -1125,7 +1181,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                 else:
                     # Copy to avoid mutating shared state; keeps CG address stable.
                     compressed_decode_seq_lens = seq_lens // self.compress_ratio
-                    if dcp_local_seq_lens is not None:
+                    if use_dcp_local_kv:
                         compressed_decode_seq_lens = get_dcp_local_seq_lens(
                             compressed_decode_seq_lens,
                             self.dcp_world_size,
@@ -1146,7 +1202,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
 
             active_width: torch.Tensor | None = None
             decode_topk_max_seq_len: int | None = None
-            if envs.VLLM_USE_B12X_SPARSE_INDEXER:
+            if self.use_b12x_sparse_indexer:
                 # Live scorer window in cache tokens. ceil(max_seq_len /
                 # compress_ratio) is an upper bound on the max compressed
                 # context across the batch, so windowing to it is
@@ -1176,7 +1232,7 @@ class DeepseekV32IndexerMetadataBuilder(AttentionMetadataBuilder):
                         use_native,
                         (
                             common_attn_metadata.dcp_local_seq_lens_cpu[:num_decodes]
-                            if dcp_local_seq_lens is not None
+                            if use_dcp_local_kv
                             and common_attn_metadata.dcp_local_seq_lens_cpu is not None
                             else None
                         ),

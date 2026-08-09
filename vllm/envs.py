@@ -63,6 +63,8 @@ if TYPE_CHECKING:
     VLLM_USE_B12X_FP8_GEMM: bool = False
     VLLM_GLM_FP8_DENSE: bool = False
     VLLM_GLM_FP8_KERNEL: str = "auto"
+    VLLM_NVFP4_MLA_DYNAMIC_SCALE: bool = False
+    VLLM_NVFP4_MLA_SCALES_FILE: str = ""
     VLLM_B12X_ABSORB_BMM: bool = False
     VLLM_DSPARK_FP8_DRAFT_HEAD: bool = False
     VLLM_USE_B12X_WO_PROJECTION: bool = False
@@ -76,16 +78,22 @@ if TYPE_CHECKING:
     VLLM_DCP_A2A_MAX_TOKENS: int = 0
     VLLM_DCP_A2A_LARGE_BACKEND: Literal["ag_rs", "a2a"] = "ag_rs"
     VLLM_DCP_SHARD_DRAFT: str | None = None
+    VLLM_DCP_REPLICATE_INDEXER_CACHE: bool = False
+    VLLM_DCP_INDEXER_SHARDS: int = 0
     VLLM_DCP_GLOBAL_TOPK: bool = True
     VLLM_DCP_TOPK_CANDIDATES: int = 0
     VLLM_DCP_TOPK_CANDIDATES_AUDIT: bool = False
     VLLM_DCP_QUERY_SPLIT: bool = False
+    VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS: int = 0
+    VLLM_DCP_TOPK_OWNER_MERGE: bool = False
     VLLM_B12X_MLA_CKV_GATHER: bool = False
     VLLM_B12X_MLA_CKV_GATHER_MIN_TOKENS: int = 16
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_V2_ALLOW_SEQUENCE_PARALLELISM: bool = False
     VLLM_B12X_BQ4_PREFILL: bool = False
     VLLM_B12X_BQ4_CAPACITY: int = 4096
+    VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
+    VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -95,7 +103,7 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
     VLLM_DISTRIBUTED_USE_SPLIT_GROUP: bool = False
     VLLM_XLA_USE_SPMD: bool = False
-    VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
+    VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn", "forkserver"] = "fork"
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -236,6 +244,7 @@ if TYPE_CHECKING:
     VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
+    VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
     VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
@@ -952,9 +961,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         int(os.getenv("VLLM_DISTRIBUTED_USE_SPLIT_GROUP", "0"))
     ),
     # Use dedicated multiprocess context for workers.
-    # Both spawn and fork work
+    # spawn, fork, and an explicitly configured forkserver are supported.
     "VLLM_WORKER_MULTIPROC_METHOD": env_with_choices(
-        "VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork"]
+        "VLLM_WORKER_MULTIPROC_METHOD", "fork", ["spawn", "fork", "forkserver"]
     ),
     # Path to the cache for storing downloaded assets
     "VLLM_ASSETS_CACHE": lambda: os.path.expanduser(
@@ -1136,6 +1145,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Use b12x for FP4 MoE experts.
     # This is opt-in while the b12x subsystems are brought over one at a time.
     "VLLM_USE_B12X_MOE": lambda: bool(int(os.getenv("VLLM_USE_B12X_MOE", "0"))),
+    "VLLM_NVFP4_MLA_DYNAMIC_SCALE": lambda: bool(
+        int(os.getenv("VLLM_NVFP4_MLA_DYNAMIC_SCALE", "0"))
+    ),
+    "VLLM_NVFP4_MLA_SCALES_FILE": lambda: os.getenv(
+        "VLLM_NVFP4_MLA_SCALES_FILE", ""
+    ).strip(),
     # Exact TP4 GLM-5.2 E64-NVFP4/E192-NF3 one-grid decode specialization.
     "VLLM_NF3_GRID188_DECODE": lambda: bool(
         int(os.getenv("VLLM_NF3_GRID188_DECODE", "1"))
@@ -1184,6 +1199,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # target indexer cache and native MTP drafts, replicated for external
     # (Eagle-style) drafts.
     "VLLM_DCP_SHARD_DRAFT": lambda: os.getenv("VLLM_DCP_SHARD_DRAFT", None),
+    # Replicate the target model's sparse-indexer K cache on every DCP rank.
+    "VLLM_DCP_REPLICATE_INDEXER_CACHE": lambda: (
+        os.getenv("VLLM_DCP_REPLICATE_INDEXER_CACHE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
+    # Number of unique sparse-indexer KV shards inside each configured DCP
+    # group. Zero keeps the configured DCP size; one fully replicates the
+    # cache. Intermediate divisors create replicated shard groups (for
+    # example, 4 under DCP8 creates two replicas of four shards).
+    "VLLM_DCP_INDEXER_SHARDS": lambda: int(os.getenv("VLLM_DCP_INDEXER_SHARDS", "0")),
     # Under DCP, gather sparse-indexer logits across ranks and select a global
     # top-k instead of a per-rank local top-k.
     "VLLM_DCP_GLOBAL_TOPK": lambda: (
@@ -1216,6 +1241,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DCP_QUERY_SPLIT": lambda: (
         os.getenv("VLLM_DCP_QUERY_SPLIT", "0").lower() in ("1", "true", "yes", "on")
     ),
+    # Keep query-split process groups initialized while selecting the faster
+    # full-query path below a deployment-calibrated context crossover.
+    "VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS": lambda: int(
+        os.getenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "0")
+    ),
+    # Send each query row's exact FP32 top-k candidates to one DCP owner, merge
+    # once there, then gather only the final indices over TP. This is an
+    # opt-in prefill path until the full TP/DCP validation matrix is complete.
+    "VLLM_DCP_TOPK_OWNER_MERGE": lambda: (
+        os.getenv("VLLM_DCP_TOPK_OWNER_MERGE", "0").lower()
+        in ("1", "true", "yes", "on")
+    ),
     "VLLM_B12X_MLA_CKV_GATHER": lambda: (
         os.getenv("VLLM_B12X_MLA_CKV_GATHER", "0").lower() in ("1", "true", "yes", "on")
     ),
@@ -1245,6 +1282,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS", "524288")
+    ),
+    # Number of future full-CKV layer gathers to queue. Zero keeps the
+    # synchronous gather path without allocating lookahead ring slots.
+    "VLLM_B12X_MLA_CKV_PREFETCH_DEPTH": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_DEPTH", "1")
+    ),
+    # Total per-lane CKV gather workspace budget, including the mandatory
+    # synchronous slot. Zero removes the cap. The requested prefetch depth is
+    # reduced automatically when its ring would exceed this budget.
+    "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
+        os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
     ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.
@@ -1884,6 +1932,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE": lambda: os.getenv(
         "VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE", "84KB"
     ),
+    # Minimum input size for uncompressed B12X DMA allreduce dispatch;
+    # defaults to 6 MiB. Accepts raw bytes or a case-insensitive KB/MB suffix.
+    # Whitespace is ignored. "off", "disabled", and "none" disable DMA.
+    # A deployment preflight may override this with a measured crossover.
+    "VLLM_PCIE_DMA_MIN_BYTES": lambda: os.getenv("VLLM_PCIE_DMA_MIN_BYTES", "6MB"),
     # Allow the b12x PCIe oneshot allreduce on cross-NUMA PCIe topologies.
     "VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA": lambda: (
         os.getenv("VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA", "1") != "0"
@@ -2294,6 +2347,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Each entry is VAR_NAME or VAR_NAME:<suffix> (suffix appended to
     # RDMA device name). Must be set together with VLLM_GPU_NIC_PCIE_MAPPING.
     "VLLM_NIC_SELECTION_VARS": lambda: os.getenv("VLLM_NIC_SELECTION_VARS", ""),
+    # --- EXL3 Trellis MoE runtime knobs (read directly by
+    # model_executor/layers/quantization/exl3.py; registered here so startup
+    # does not flag them as unknown). All are passthrough: consuming code
+    # applies its own defaults (the Trellis window minimum is 1 for both target
+    # and draft layers; an explicit value is a diagnostic override).
+    "VLLM_EXL3_TRELLIS_MIN_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MIN_M"),
+    "VLLM_EXL3_TRELLIS_MAX_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_MAX_M"),
+    "VLLM_EXL3_TRELLIS_BLOCK_M": lambda: os.getenv("VLLM_EXL3_TRELLIS_BLOCK_M"),
+    "VLLM_EXL3_PREFILL_CHUNK": lambda: os.getenv("VLLM_EXL3_PREFILL_CHUNK"),
+    "VLLM_EXL3_PREFILL_TRELLIS": lambda: os.getenv("VLLM_EXL3_PREFILL_TRELLIS"),
+    "VLLM_EXL3_PREFILL_BLOCK_M": lambda: os.getenv("VLLM_EXL3_PREFILL_BLOCK_M"),
+    # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
+    "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
+    "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
+
 }
 
 

@@ -5,11 +5,14 @@ import pytest
 import torch
 
 from vllm import envs
+from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.mla_attention import (
     MLAAttention,
     _can_use_b12x_dcp_prefill_workspace,
     _estimate_dcp_ag_rs_transient_bytes,
+    _should_allocate_sparse_profile_workspace,
 )
+from vllm.utils.multi_stream_utils import vllm_cudagraph_capture_scope
 from vllm.v1.attention.backends.mla.b12x_mla_sparse import B12xMLASparseImpl
 from vllm.v1.attention.ops import common
 
@@ -77,7 +80,11 @@ def test_dcp_workspace_gate_accepts_valid_rows(num_tokens, max_num_tokens):
     )
 
 
-def _make_profile_attention(*, workspace_enabled: bool, pure_a2a: bool = False):
+def _make_profile_attention(
+    *,
+    workspace_enabled: bool,
+    pure_a2a: bool = False,
+):
     class Backend:
         @staticmethod
         def get_name():
@@ -255,9 +262,7 @@ def test_cp_lse_ag_out_rs_into_preserves_borrowed_output(monkeypatch, world_size
 
 
 def test_cp_lse_ag_out_rs_requests_head_major_output(monkeypatch):
-    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(
-        8, 3, 16
-    )
+    corrected_storage = torch.arange(8 * 3 * 16, dtype=torch.bfloat16).view(8, 3, 16)
     corrected = corrected_storage.movedim(0, 1)
     corrected_lse = torch.zeros(3, 8, dtype=torch.float32)
 
@@ -446,3 +451,11 @@ def test_dcp_workspace_projection_accepts_aligned_head_capacity_pitch(monkeypatc
     assert attn_out.stride() == (kv_lora_rank, max_batched * kv_lora_rank, 1)
     assert actual.movedim(0, 1).is_contiguous()
     torch.testing.assert_close(actual, expected)
+
+
+def test_sparse_profile_workspace_skips_cudagraph_capture_scope() -> None:
+    assert _should_allocate_sparse_profile_workspace(1)
+    assert not _should_allocate_sparse_profile_workspace(0)
+    with vllm_cudagraph_capture_scope():
+        assert mla_attention.is_vllm_cudagraph_capture_active()
+        assert not _should_allocate_sparse_profile_workspace(1)

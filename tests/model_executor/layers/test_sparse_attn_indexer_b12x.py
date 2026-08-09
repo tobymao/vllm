@@ -55,6 +55,19 @@ def test_prefill_query_to_seq_rejects_ambiguous_multi_request_chunk() -> None:
         )
 
 
+def test_query_split_context_crossover_env(monkeypatch):
+    monkeypatch.delenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", raising=False)
+    assert indexer_mod._dcp_query_split_context_eligible(1)
+
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "65536")
+    assert not indexer_mod._dcp_query_split_context_eligible(8192)
+    assert indexer_mod._dcp_query_split_context_eligible(65536)
+
+    monkeypatch.setenv("VLLM_DCP_QUERY_SPLIT_MIN_CONTEXT_TOKENS", "-1")
+    with pytest.raises(ValueError, match="must be non-negative"):
+        indexer_mod._dcp_query_split_context_eligible(65536)
+
+
 def _profile_forward_context():
     return types.SimpleNamespace(
         attn_metadata=None,
@@ -81,17 +94,97 @@ class _FakeWorkspaceManager:
         return tensors
 
 
+def test_replicated_constructor_uses_single_rank_without_dcp_group(monkeypatch):
+    def init_module(self):
+        torch.nn.Module.__init__(self)
+
+    def fail_dcp_group(*_args):
+        pytest.fail("replicated indexer construction must not query the DCP group")
+
+    monkeypatch.setattr(indexer_mod.CustomOp, "__init__", init_module)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                decode_context_parallel_size=4,
+                cp_kv_cache_interleave_size=1,
+            )
+        ),
+    )
+    monkeypatch.setattr(indexer_mod, "get_indexer_dcp_group", fail_dcp_group)
+    monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
+
+    indexer = indexer_mod.SparseAttnIndexer(
+        k_cache=torch.nn.Identity(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 4), dtype=torch.int32),
+        dcp_replicated=True,
+    )
+
+    assert indexer.dcp_replicated is True
+    assert indexer.dcp_world_size == 1
+    assert indexer.dcp_rank == 0
+
+
+@pytest.mark.parametrize("kv_shards", [2, 4])
+def test_sharded_constructor_requests_group_matching_kv_shards(monkeypatch, kv_shards):
+    def init_module(self):
+        torch.nn.Module.__init__(self)
+
+    requested_sizes: list[int] = []
+
+    def get_group(expected_world_size):
+        requested_sizes.append(expected_world_size)
+        return types.SimpleNamespace(world_size=expected_world_size, rank_in_group=1)
+
+    monkeypatch.setattr(indexer_mod.CustomOp, "__init__", init_module)
+    monkeypatch.setattr(
+        indexer_mod,
+        "get_current_vllm_config",
+        lambda: types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(
+                decode_context_parallel_size=4,
+                cp_kv_cache_interleave_size=1,
+            )
+        ),
+    )
+    monkeypatch.setattr(indexer_mod, "get_indexer_dcp_group", get_group)
+    monkeypatch.setattr(indexer_mod, "use_b12x_sparse_indexer", lambda: True)
+
+    indexer = indexer_mod.SparseAttnIndexer(
+        k_cache=torch.nn.Identity(),
+        quant_block_size=128,
+        scale_fmt="ue8m0",
+        topk_tokens=4,
+        head_dim=128,
+        max_model_len=4096,
+        max_total_seq_len=4096,
+        topk_indices_buffer=torch.empty((2, 4), dtype=torch.int32),
+        dcp_kv_shard_count=kv_shards,
+    )
+
+    assert requested_sizes == [kv_shards]
+    assert indexer.dcp_world_size == kv_shards
+    assert indexer.dcp_rank == 1
+
+
 def _install_fake_b12x_indexer(
     monkeypatch,
     calls: list[tuple],
     *,
     prefill_route: str = "packed_contiguous",
 ):
-    sparkinfer_mod = types.ModuleType("sparkinfer")
-    sparkinfer_mod.__path__ = []
-    attention_mod = types.ModuleType("sparkinfer.attention")
+    b12x_mod = types.ModuleType("b12x")
+    b12x_mod.__path__ = []
+    attention_mod = types.ModuleType("b12x.attention")
     attention_mod.__path__ = []
-    indexer_mod = types.ModuleType("sparkinfer.attention.nsa_indexer")
+    indexer_mod = types.ModuleType("b12x.attention.nsa_indexer")
     indexer_mod.__path__ = []
 
     class _Caps:
@@ -191,23 +284,23 @@ def _install_fake_b12x_indexer(
     indexer_mod.uses_paged_schedule = uses_paged_mqa_schedule
     indexer_mod.plan_paged_schedule = build_paged_mqa_schedule_metadata
 
-    sparkinfer_mod.attention = attention_mod
+    b12x_mod.attention = attention_mod
     attention_mod.nsa_indexer = indexer_mod
-    monkeypatch.setitem(sys.modules, "sparkinfer", sparkinfer_mod)
-    monkeypatch.setitem(sys.modules, "sparkinfer.attention", attention_mod)
+    monkeypatch.setitem(sys.modules, "b12x", b12x_mod)
+    monkeypatch.setitem(sys.modules, "b12x.attention", attention_mod)
     monkeypatch.setitem(
         sys.modules,
-        "sparkinfer.attention.nsa_indexer",
+        "b12x.attention.nsa_indexer",
         indexer_mod,
     )
 
 
 def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
-    tiled_topk_mod = types.ModuleType("sparkinfer.attention.nsa_indexer.tiled_topk")
+    tiled_topk_mod = types.ModuleType("b12x.attention.nsa_indexer.tiled_topk")
     tiled_topk_mod.run_row_topk = run_row_topk
     monkeypatch.setitem(
         sys.modules,
-        "sparkinfer.attention.nsa_indexer.tiled_topk",
+        "b12x.attention.nsa_indexer.tiled_topk",
         tiled_topk_mod,
     )
 
@@ -238,6 +331,94 @@ def _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, *, world_size: int):
         "triton_gather_topk_ids_by_position",
         gather_topk_ids_by_position,
     )
+
+
+def test_query_split_gathers_indices_in_place_without_scores():
+    calls: list[tuple[int, int]] = []
+
+    class FakePyNccl:
+        disabled = False
+
+        def all_gather(self, output, input_):
+            calls.append((output.data_ptr(), input_.data_ptr()))
+            rows = input_.shape[0]
+            output[:rows].fill_(10)
+            output[rows:].fill_(20)
+
+    group = types.SimpleNamespace(
+        world_size=2,
+        rank_in_group=1,
+        device_communicator=types.SimpleNamespace(pynccl_comm=FakePyNccl()),
+    )
+    gathered_indices = torch.full((4, 3), -1, dtype=torch.int32)
+    local_indices = gathered_indices[2:]
+    local_indices.fill_(20)
+    scores = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    scores_before = scores.clone()
+
+    indexer_mod._query_split_all_gather_indices(
+        group,
+        local_indices,
+        gathered_indices,
+    )
+
+    assert calls == [(gathered_indices.data_ptr(), local_indices.data_ptr())]
+    assert gathered_indices.tolist() == [[10] * 3, [10] * 3, [20] * 3, [20] * 3]
+    assert torch.equal(scores, scores_before)
+
+
+def test_query_split_copies_aliased_input_for_torch_distributed_fallback(
+    monkeypatch,
+):
+    calls: list[tuple[int, int]] = []
+
+    def fake_all_gather_into_tensor(output, input_, *, group):
+        assert group == "device-group"
+        calls.append((output.data_ptr(), input_.data_ptr()))
+        rows = input_.shape[0]
+        output[:rows].fill_(10)
+        output[rows:].copy_(input_)
+
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_into_tensor",
+        fake_all_gather_into_tensor,
+    )
+    group = types.SimpleNamespace(
+        world_size=2,
+        rank_in_group=1,
+        device_group="device-group",
+        device_communicator=types.SimpleNamespace(
+            pynccl_comm=types.SimpleNamespace(disabled=True),
+        ),
+    )
+    gathered_indices = torch.full((4, 3), -1, dtype=torch.int32)
+    local_indices = gathered_indices[2:]
+    local_indices.fill_(20)
+    local_ptr = local_indices.data_ptr()
+
+    indexer_mod._query_split_all_gather_indices(
+        group,
+        local_indices,
+        gathered_indices,
+    )
+
+    assert calls[0][0] == gathered_indices.data_ptr()
+    assert calls[0][1] != local_ptr
+    assert gathered_indices.tolist() == [[10] * 3, [10] * 3, [20] * 3, [20] * 3]
+
+
+def test_query_split_rejects_non_aliasing_local_indices():
+    group = types.SimpleNamespace(world_size=2, rank_in_group=0)
+    gathered_indices = torch.empty((4, 3), dtype=torch.int32)
+    local_indices = torch.empty((2, 3), dtype=torch.int32)
+
+    with pytest.raises(RuntimeError, match="must alias"):
+        indexer_mod._query_split_all_gather_indices(
+            group,
+            local_indices,
+            gathered_indices,
+        )
 
 
 @pytest.mark.parametrize(
@@ -456,7 +637,7 @@ def test_b12x_prefill_indexer_requires_packed_contiguous_route(monkeypatch):
         64 * 576,
     ],
 )
-def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
+def test_replicated_decode_skips_dcp_merge_and_keeps_global_topk_ids(
     monkeypatch,
     page_stride0,
 ):
@@ -482,6 +663,12 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
         lambda: torch.uint8,
         raising=False,
     )
+    monkeypatch.setattr(indexer_mod, "_dcp_global_topk_requested", lambda: True)
+
+    def fail_dcp_merge(**kwargs):
+        pytest.fail("replicated indexer must not all-gather top-k candidates")
+
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk", fail_dcp_merge)
 
     q_rows = 2
     num_heads = 1
@@ -550,6 +737,7 @@ def test_sparse_attn_indexer_decode_uses_non_shared_b12x_binding(
     )
 
     assert result is topk_indices_buffer
+    # B12X indexes the full replicated cache, so its logical IDs are already global.
     assert topk_indices_buffer.tolist() == [[123] * topk, [123] * topk]
     assert calls == [
         (
@@ -746,6 +934,273 @@ def test_b12x_dcp_merge_passes_contiguous_scores_to_topk(monkeypatch):
     )
 
     assert run_row_topk_calls == [(True, (2, 8))]
+
+
+def test_b12x_dcp_owner_merge_exact_query_split_rows(monkeypatch):
+    topk = 2
+    dcp_size = 2
+    tp_size = 4
+    tp_rank = 1
+    rows = 4
+    owner_rows = rows // dcp_size
+
+    source_ids = torch.tensor(
+        [
+            [[10, 11], [20, 21]],
+            [[12, 13], [22, 23]],
+        ],
+        dtype=torch.int32,
+    )
+    source_scores = torch.tensor(
+        [
+            [[0.10, 0.90], [0.80, 0.20]],
+            [[0.70, 0.30], [0.40, 0.60]],
+        ],
+        dtype=torch.float32,
+    )
+    received = torch.empty((dcp_size, owner_rows, 2, topk), dtype=torch.int32)
+    received[:, :, 0, :].copy_(source_ids)
+    received[:, :, 1, :].copy_(source_scores.view(torch.int32))
+
+    class FakeDCPGroup:
+        world_size = dcp_size
+
+        @staticmethod
+        def all_to_all_single(output, input_):
+            assert tuple(input_.shape) == (rows, 2, topk)
+            output.copy_(received.reshape_as(output))
+
+    class FakeTPGroup:
+        world_size = tp_size
+        rank_in_group = tp_rank
+
+        @staticmethod
+        def all_gather(input_, dim):
+            assert dim == 0
+            assert input_.tolist() == [[11, 12], [20, 23]]
+            shards = [
+                torch.tensor([[0, 1], [2, 3]], dtype=torch.int32),
+                input_.clone(),
+                torch.tensor([[40, 41], [42, 43]], dtype=torch.int32),
+                torch.tensor([[60, 61], [62, 63]], dtype=torch.int32),
+            ]
+            return torch.cat(shards, dim=0)
+
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        assert lengths.tolist() == [4, 4]
+        values, positions = torch.topk(row_logits, k=topk, dim=1)
+        output_values.copy_(values)
+        output_indices.copy_(positions.to(torch.int32))
+
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
+
+    class ConfiguredDCPGroup:
+        world_size = tp_size
+
+        @staticmethod
+        def all_to_all_single(*args, **kwargs):
+            raise AssertionError("owner merge must use the indexer shard group")
+
+    selected_world_sizes = []
+
+    def get_indexer_dcp_group(expected_world_size):
+        selected_world_sizes.append(expected_world_size)
+        return FakeDCPGroup()
+
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_indexer_dcp_group",
+        get_indexer_dcp_group,
+        raising=False,
+    )
+    monkeypatch.setattr(parallel_state, "get_dcp_group", lambda: ConfiguredDCPGroup())
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
+    workspace_manager = _FakeWorkspaceManager()
+    monkeypatch.setattr(
+        indexer_mod, "current_workspace_manager", lambda: workspace_manager
+    )
+
+    gathered_indices = torch.full((8, topk), -1, dtype=torch.int32)
+    local_indices = gathered_indices[:rows]
+    local_indices.copy_(torch.arange(rows * topk, dtype=torch.int32).view(rows, topk))
+    local_scores = torch.zeros((rows, topk), dtype=torch.float32)
+
+    used = indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=local_indices,
+        topk_scores=local_scores,
+        gathered_topk_indices=gathered_indices,
+        topk_tokens=topk,
+        dcp_world_size=dcp_size,
+        dcp_rank=1,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used
+    assert selected_world_sizes == [dcp_size]
+    assert gathered_indices.tolist() == [
+        [0, 1],
+        [2, 3],
+        [11, 12],
+        [20, 23],
+        [40, 41],
+        [42, 43],
+        [60, 61],
+        [62, 63],
+    ]
+    assert workspace_manager.specs == (
+        ((4, 2, 2), torch.int32),
+        ((4, 2, 2), torch.int32),
+        ((2, 4), torch.int32),
+        ((2, 4), torch.int32),
+        ((2,), torch.int32),
+        ((2, 2), torch.float32),
+        ((2, 2), torch.int32),
+        ((2, 2), torch.int32),
+    )
+
+
+def test_b12x_dcp_owner_merge_supports_tp_equal_dcp(monkeypatch):
+    topk = 2
+    dcp_size = 4
+    rows = 4
+    received_ids = torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+    received_scores = torch.tensor([0.1, 0.9, 0.7, 0.3], dtype=torch.float32)
+
+    class FakeDCPGroup:
+        world_size = dcp_size
+
+        @staticmethod
+        def all_to_all_single(output, input_):
+            output_view = output.view(dcp_size, 1, 2, topk)
+            output_view[:, 0, 0, 0].copy_(received_ids)
+            output_view[:, 0, 0, 1].fill_(-1)
+            output_view[:, 0, 1, 0].copy_(received_scores.view(torch.int32))
+            output_view[:, 0, 1, 1].fill_(
+                torch.tensor(-float("inf"), dtype=torch.float32).view(torch.int32)
+            )
+
+    class FakeTPGroup:
+        world_size = dcp_size
+        rank_in_group = 2
+
+        @staticmethod
+        def all_gather(input_, dim):
+            assert dim == 0
+            assert input_.tolist() == [[20, 30]]
+            return torch.tensor(
+                [[0, 1], [10, 11], [20, 30], [40, 41]], dtype=torch.int32
+            )
+
+    def run_row_topk(*, row_logits, lengths, topk, output_values, output_indices):
+        values, positions = torch.topk(row_logits, k=topk, dim=1)
+        output_values.copy_(values)
+        output_indices.copy_(positions.to(torch.int32))
+
+    _install_fake_b12x_dcp_merge(monkeypatch, run_row_topk, world_size=dcp_size)
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        indexer_mod,
+        "_get_owner_merge_dcp_group",
+        lambda expected_world_size: FakeDCPGroup(),
+    )
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: FakeTPGroup())
+    monkeypatch.setattr(indexer_mod, "_use_triton_dcp_remap", lambda _: False)
+    monkeypatch.setattr(
+        indexer_mod,
+        "current_workspace_manager",
+        lambda: _FakeWorkspaceManager(),
+    )
+
+    indices = torch.arange(rows * topk, dtype=torch.int32).view(rows, topk)
+    scores = torch.zeros((rows, topk), dtype=torch.float32)
+    used = indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=indices,
+        topk_scores=scores,
+        gathered_topk_indices=indices,
+        topk_tokens=topk,
+        dcp_world_size=dcp_size,
+        dcp_rank=2,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used
+    assert indices.tolist() == [[0, 1], [10, 11], [20, 30], [40, 41]]
+
+
+def test_b12x_dcp_owner_merge_falls_back_for_tail(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "get_tp_group",
+        lambda: pytest.fail("tail fallback must not initialize a TP collective"),
+    )
+    topk_indices = torch.zeros((3, 2), dtype=torch.int32)
+    topk_scores = torch.zeros((3, 2), dtype=torch.float32)
+
+    assert not indexer_mod._merge_b12x_dcp_topk_by_owner(
+        topk_indices=topk_indices,
+        topk_scores=topk_scores,
+        gathered_topk_indices=torch.empty((6, 2), dtype=torch.int32),
+        topk_tokens=2,
+        dcp_world_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=16,
+    )
+
+
+@pytest.mark.parametrize(
+    ("enabled", "owner_result", "expected_owner_calls", "expected_oracle_calls"),
+    [
+        (False, True, 0, 1),
+        (True, False, 1, 1),
+        (True, True, 1, 0),
+    ],
+)
+def test_b12x_prefill_dcp_topk_routes_owner_or_oracle(
+    monkeypatch,
+    enabled,
+    owner_result,
+    expected_owner_calls,
+    expected_oracle_calls,
+):
+    owner_calls = []
+    oracle_calls = []
+
+    def fake_owner(**kwargs):
+        owner_calls.append(kwargs)
+        return owner_result
+
+    def fake_oracle(**kwargs):
+        oracle_calls.append(kwargs)
+
+    monkeypatch.setattr(
+        indexer_mod.envs,
+        "VLLM_DCP_TOPK_OWNER_MERGE",
+        enabled,
+    )
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk_by_owner", fake_owner)
+    monkeypatch.setattr(indexer_mod, "_merge_b12x_dcp_topk", fake_oracle)
+
+    indices = torch.empty((4, 2), dtype=torch.int32)
+    scores = torch.empty((4, 2), dtype=torch.float32)
+    used = indexer_mod._merge_b12x_prefill_dcp_topk(
+        topk_indices=indices,
+        topk_scores=scores,
+        gathered_topk_indices=indices,
+        topk_tokens=2,
+        dcp_world_size=2,
+        dcp_rank=0,
+        cp_kv_cache_interleave_size=16,
+    )
+
+    assert used is (enabled and owner_result)
+    assert len(owner_calls) == expected_owner_calls
+    assert len(oracle_calls) == expected_oracle_calls
 
 
 def test_b12x_dcp_merge_warmup_reserves_workspace(monkeypatch):
@@ -1000,7 +1455,7 @@ def test_b12x_dcp_profile_uses_planner_page_table_width(monkeypatch):
         raising=False,
     )
     monkeypatch.setattr(indexer_mod.envs, "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", 512)
-    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda: (2, 0, 1))
+    monkeypatch.setattr(indexer_mod, "_get_dcp_warmup_params", lambda *_: (2, 0, 1))
     monkeypatch.setattr(indexer_mod, "_prewarm_b12x_dcp_topk_merge", lambda **_: None)
 
     q_rows = 8192
@@ -1112,9 +1567,12 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
     monkeypatch.setattr(
         mla_indexer_mod.envs,
         "VLLM_USE_B12X_SPARSE_INDEXER",
-        True,
+        False,
     )
     builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    # Backend selection is resolved once in __init__. The metadata path must
+    # use that result even when the legacy environment flag is unset.
+    builder.use_b12x_sparse_indexer = True
     builder.scheduler_metadata_buffer = torch.zeros((5, 2), dtype=torch.int32)
     builder.kv_cache_spec = types.SimpleNamespace(storage_block_size=64)
     builder.num_sms = 4
@@ -1135,6 +1593,27 @@ def test_b12x_schedule_metadata_uses_canonical_indexer_import(monkeypatch):
         ("uses_schedule", 2, 3),
         ("build_schedule", (64, 128), 64, 4, True),
     ]
+
+
+def test_b12x_schedule_metadata_respects_cached_backend_choice(monkeypatch):
+    from vllm.v1.attention.backends.mla import indexer as mla_indexer_mod
+
+    monkeypatch.setattr(
+        mla_indexer_mod.envs,
+        "VLLM_USE_B12X_SPARSE_INDEXER",
+        True,
+    )
+    builder = object.__new__(mla_indexer_mod.DeepseekV32IndexerMetadataBuilder)
+    builder.use_b12x_sparse_indexer = False
+
+    result = builder._maybe_build_b12x_schedule_metadata(
+        seq_lens=torch.tensor([64], dtype=torch.int32),
+        block_table=torch.zeros((1, 1), dtype=torch.int32),
+        num_decode_tokens=1,
+        requires_padding=False,
+    )
+
+    assert result is None
 
 
 def test_mtp_variable_decode_preserves_block_table_alignment_padding():
