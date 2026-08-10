@@ -99,9 +99,29 @@ class DiskBackend:
             t.stride(0) * t.element_size() for t in gpu_caches.values()
         ]
 
-        assert total_block_bytes % _ALIGNMENT == 0, (
-            f"total_block_bytes={total_block_bytes} not aligned to {_ALIGNMENT}"
-        )
+        # O_DIRECT requires the file offset, every iovec base and every iovec
+        # length to be _ALIGNMENT-aligned. Slot k of a staging buffer sits at
+        # k*bpb, so an unaligned per-tensor bpb misaligns both the address and
+        # the length; total_block_bytes sets the file offset. Checking the sum
+        # alone is not enough once there is more than one tensor.
+        #
+        # Packed MLA layouts do not satisfy this: GLM-5.2 at fp8_ds_mla is
+        # 3,502,592 B/block = 2^9 * 6841, so 512-aligned but not 4096. The odd
+        # factor comes from the per-token size, so no block size can fix it.
+        # Alignment is a precondition of O_DIRECT, not of the backend -- fall
+        # back to the page cache instead of refusing to run.
+        unaligned = [
+            b for b in (*self._per_tensor_bpb, total_block_bytes) if b % _ALIGNMENT
+        ]
+        if unaligned and not use_page_cache:
+            logger.warning(
+                "DiskBackend: block bytes %s not aligned to %d; disabling O_DIRECT "
+                "and falling back to the page cache. Transfers will be backed by "
+                "host DRAM and stores cost an extra copy.",
+                unaligned,
+                _ALIGNMENT,
+            )
+            use_page_cache = True
 
         # Separate buffer pools for store and load threads
         self._store_buffer_caches = {}
