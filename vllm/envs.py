@@ -91,6 +91,8 @@ if TYPE_CHECKING:
     VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: int = 524288
     VLLM_B12X_MLA_CKV_PREFETCH_DEPTH: int = 1
     VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB: int = 1024
+    VLLM_B12X_MLA_SPEC_DECODE_MAX_Q: int = 8
+    VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE: str = "auto"
     VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE: bool = False
     VLLM_B12X_CUDAGRAPH_PIECEWISE_PREWARM: bool = False
     VLLM_B12X_MOE_FORCE_MODELOPT_PREP: bool = False
@@ -192,6 +194,7 @@ if TYPE_CHECKING:
     VLLM_RUST_FRONTEND_PATH: str | None = "auto"
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
+    VLLM_PROMPT_LOGPROBS_CHUNK_SIZE: int = 1024
     VLLM_MLA_DISABLE: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH: bool = False
     VLLM_DSPARK_DYNAMIC_DRAFT_DEPTH_WINDOW: int = 8
@@ -238,12 +241,17 @@ if TYPE_CHECKING:
     VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS: list[str] | None = None
     VLLM_FLASHINFER_ALLREDUCE_BACKEND: Literal["auto", "trtllm", "mnnvl"] = "auto"
     VLLM_ENABLE_PCIE_ALLREDUCE: bool = False
-    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp"] = "cpp"
+    VLLM_PCIE_ALLREDUCE_BACKEND: Literal["b12x", "cpp", "flashinfer-ipc"] = "cpp"
     VLLM_PCIE_ONESHOT_ALLREDUCE_MAX_SIZE: str = "84KB"
     VLLM_PCIE_ONESHOT_FUSED_ADD_RMS_NORM_MAX_SIZE: str = "84KB"
     VLLM_PCIE_DMA_MIN_BYTES: str = "6MB"
     VLLM_PCIE_ONESHOT_ALLOW_CROSS_NUMA: bool = True
     VLLM_PCIE_ONESHOT_SINGLE_CHANNEL: bool = False
+    VLLM_PCIE_DMA_FP8: str | None = None
+    VLLM_CPP_AR_1STAGE_NCCL_CUTOFF: str | None = None
+    VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS: int | None = None
+    VLLM_USE_B12X_PCIE_DMA: bool = False
+    VLLM_CACHE_DIR: str | None = None
     VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE: int = 394 * 1024 * 1024
     VLLM_XGRAMMAR_CACHE_MB: int = 0
     VLLM_REGEX_COMPILATION_TIMEOUT_S: int = 5
@@ -1267,6 +1275,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB": lambda: int(
         os.getenv("VLLM_B12X_MLA_CKV_PREFETCH_WORKSPACE_MIB", "1024")
     ),
+    # Short speculative extends may use the B12X sparse-MLA decode kernel.
+    # Backend validation remains authoritative because eligibility also
+    # depends on the active speculative configuration.
+    "VLLM_B12X_MLA_SPEC_DECODE_MAX_Q": lambda: int(
+        os.getenv("VLLM_B12X_MLA_SPEC_DECODE_MAX_Q", "8")
+    ),
+    "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE": lambda: os.getenv(
+        "VLLM_B12X_MLA_SPEC_EXTEND_AS_DECODE", "auto"
+    ),
     # Diagnostic flag retained for local experiments. MiniMax M3 compile is
     # fail-closed in the model until the no-break path is validated.
     "VLLM_MINIMAX_M3_ENABLE_TORCH_COMPILE": lambda: bool(
@@ -1593,6 +1610,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE": lambda: int(
         os.getenv("VLLM_V1_OUTPUT_PROC_CHUNK_SIZE", "128")
     ),
+    # Maximum prompt-token rows materialized in the full-vocabulary logits
+    # tensor at once while computing V1 prompt logprobs.
+    "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_PROMPT_LOGPROBS_CHUNK_SIZE", "1024")
+    ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
     # Physically shorten DSpark's next draft block from the historical
@@ -1894,7 +1916,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_PCIE_ALLREDUCE_BACKEND": env_with_choices(
         "VLLM_PCIE_ALLREDUCE_BACKEND",
         "cpp",
-        ["b12x", "cpp"],
+        ["b12x", "cpp", "flashinfer-ipc"],
     ),
     # Max input size for the b12x PCIe oneshot allreduce dispatch.
     # Accepts raw bytes or a KB/MB suffix (e.g. "84KB").
@@ -1920,6 +1942,23 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_PCIE_ONESHOT_SINGLE_CHANNEL", "0").strip().lower()
         not in ("", "0", "false", "no", "off")
     ),
+    # Optional wire format and crossover tuning read by the custom-allreduce
+    # integration. Unset values delegate to backend-owned defaults.
+    "VLLM_PCIE_DMA_FP8": lambda: os.getenv("VLLM_PCIE_DMA_FP8"),
+    "VLLM_CPP_AR_1STAGE_NCCL_CUTOFF": lambda: os.getenv(
+        "VLLM_CPP_AR_1STAGE_NCCL_CUTOFF"
+    ),
+    "VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_CPP_AR_IGNORE_CUTOFF_MAX_ROWS")) is not None
+        else None
+    ),
+    # The DS4 launcher exports these for B12X and compiler-cache consumers.
+    # Register them so vLLM validation does not reject a supported launch.
+    "VLLM_USE_B12X_PCIE_DMA": lambda: bool(
+        int(os.getenv("VLLM_USE_B12X_PCIE_DMA", "0"))
+    ),
+    "VLLM_CACHE_DIR": lambda: os.getenv("VLLM_CACHE_DIR"),
     # Control the workspace buffer size for the FlashInfer backend.
     "VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE": lambda: int(
         os.getenv("VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE", str(394 * 1024 * 1024))
@@ -2334,7 +2373,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Prebuilt exllamav3 extension location and torch-ABI compatibility shim.
     "VLLM_EXL3_EXT_PATH": lambda: os.getenv("VLLM_EXL3_EXT_PATH"),
     "VLLM_EXL3_ABI_SHIM": lambda: os.getenv("VLLM_EXL3_ABI_SHIM"),
-
 }
 
 
@@ -2480,6 +2518,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_WORKER_MULTIPROC_METHOD",
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
+        "VLLM_PROMPT_LOGPROBS_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",

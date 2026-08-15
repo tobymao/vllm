@@ -813,6 +813,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert sample_hidden_states is not None
             if self.pooling_runner is None:
                 self._dummy_sampler_run(sample_hidden_states)
+                assert hidden_states is not None
+                assert self.prompt_logprobs_worker is not None
+                self.prompt_logprobs_worker.profile_run(
+                    self.model.compute_logits,
+                    hidden_states,
+                    self.model_config.max_logprobs,
+                )
+                logger.info_once(
+                    "Profiled V1 prompt-logprobs workspace with chunk size %d",
+                    self.prompt_logprobs_worker.chunk_size,
+                )
             else:
                 self._dummy_pooler_run(hidden_states)
 
@@ -967,11 +978,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    channel_id="vllm:target:profile",
                     progress_bar_desc="Profiling CUDA graph memory",
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(1):
-                        self.speculator.capture()
+                        self.speculator.capture(capture_phase="profile")
                 self._zero_cudagraph_capture_kv_blocks()
             end_free_gpu_memory = torch.accelerator.get_memory_info()[0]
             gross_cuda_graph_size = max(start_free_gpu_memory - end_free_gpu_memory, 0)
@@ -1050,10 +1062,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     has_lora=self.lora_config is not None,
                     use_aux_hidden_state_outputs=self.use_aux_hidden_state_outputs,
                     lora_capture_hook=create_lora_capture_hook(self.lora_config, self),
+                    channel_id="vllm:target:production",
                 )
                 if self.speculator is not None:
                     with use_workspace_lane(1):
-                        self.speculator.capture()
+                        self.speculator.capture(capture_phase="production")
                 self._zero_cudagraph_capture_kv_blocks()
         finally:
             self._release_cudagraph_pool_anchor()

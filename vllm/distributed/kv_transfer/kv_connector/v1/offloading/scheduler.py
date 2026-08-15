@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from itertools import chain, islice
 from typing import Any, NamedTuple
 
+import vllm.envs as envs
 from vllm.config import VllmConfig
 from vllm.distributed.kv_events import KVCacheEvent
 from vllm.distributed.kv_transfer.kv_connector.utils import yield_req_data
@@ -84,10 +85,11 @@ class GroupOffloadConfig(NamedTuple):
     kv_event_group_spec: OffloadingEventGroupSpec
     # None below means full attention
     sliding_window_size_in_chunks: int | None
-    # Number of this group's offloaded chunks per full-attention alignment
-    # segment. Used to skip storing SWA chunks that can never serve a load
-    # hit (e.g. DeepSeek V4 where SWA groups have much smaller block sizes
-    # than the MLA full-attention group).
+    # Number of this group's offloaded chunks per sparsity segment (the
+    # full-attention alignment size, or VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+    # when sparse retention is configured). Used to skip storing SWA chunks
+    # that can never serve a load hit (e.g. DeepSeek V4 where SWA groups have
+    # much smaller block sizes than the MLA full-attention group).
     # None for full-attention groups or when the optimization doesn't apply.
     alignment_chunk_count: int | None = None
     # True for EAGLE/MTP draft-model attention groups. The trailing chunk
@@ -136,6 +138,11 @@ class SchedulerOffloadConfig(NamedTuple):
     blocks_per_chunk: int
     num_workers: int
     offload_prompt_only: bool
+    # Token alignment of the per-request "replay boundary" tail (see
+    # OffloadingConnectorScheduler._replay_tail_end_chunk). Set to the
+    # full-attention alignment size when sparse retention
+    # (VLLM_PREFIX_CACHE_RETENTION_INTERVAL) is enabled, else None.
+    replay_alignment_tokens: int | None = None
 
     @classmethod
     def from_spec(
@@ -164,16 +171,34 @@ class SchedulerOffloadConfig(NamedTuple):
         if len(full_attn_tokens_per_chunk) == 1:
             alignment_tokens = full_attn_tokens_per_chunk.pop()
 
+        # Mirror SlidingWindowManager.reachable_block_mask's segment-size
+        # choice: with sparse retention (VLLM_PREFIX_CACHE_RETENTION_INTERVAL)
+        # the local GPU prefix cache keeps SWA tails once per retention
+        # segment rather than at every full-attention block boundary. Use the
+        # same granularity so stored tails sit exactly where lookups converge.
+        # An interval of 0 (latest-boundary-only retention) disables the
+        # store-side skip entirely (conservative: store all chunks).
+        retention_interval = envs.VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+        segment_tokens: int | None = (
+            alignment_tokens
+            if retention_interval is None
+            else (None if retention_interval == 0 else retention_interval)
+        )
+
         def _alignment_chunk_count(
             tokens_per_chunk: int,
             sliding_window_size_in_chunks: int | None,
+            is_eagle_group: bool,
         ) -> int | None:
-            if alignment_tokens is None or sliding_window_size_in_chunks is None:
+            if segment_tokens is None or sliding_window_size_in_chunks is None:
                 return None
-            if alignment_tokens <= tokens_per_chunk:
+            if segment_tokens <= tokens_per_chunk:
                 return None
-            per_segment = alignment_tokens // tokens_per_chunk
-            if sliding_window_size_in_chunks >= per_segment:
+            per_segment = segment_tokens // tokens_per_chunk
+            # Contiguous chunks a hit needs at a segment boundary, including
+            # the "+1 peek" chunk for EAGLE/MTP groups (see _lookup).
+            need = sliding_window_size_in_chunks + (1 if is_eagle_group else 0)
+            if need >= per_segment:
                 return None
             return per_segment
 
@@ -216,7 +241,9 @@ class SchedulerOffloadConfig(NamedTuple):
                         )
                     ),
                     alignment_chunk_count=_alignment_chunk_count(
-                        tokens_per_block * spec.blocks_per_chunk, sw
+                        tokens_per_block * spec.blocks_per_chunk,
+                        sw,
+                        idx in eagle_groups,
                     ),
                     kv_event_group_spec=get_offloading_event_group_spec(
                         kv_cache_config.kv_cache_groups[idx]
@@ -227,6 +254,9 @@ class SchedulerOffloadConfig(NamedTuple):
             ),
             blocks_per_chunk=spec.blocks_per_chunk,
             offload_prompt_only=spec.offload_prompt_only,
+            replay_alignment_tokens=(
+                alignment_tokens if retention_interval is not None else None
+            ),
         )
 
 
@@ -258,6 +288,8 @@ class RequestOffloadState:
     # time.monotonic() of this request's first deferred offload lookup;
     # None once consumed (observed) or while no lookup is pending.
     deferred_lookup_start_time: float | None = None
+    # True once on_request_finished has been signaled to the manager.
+    finished_signaled: bool = False
 
     def __post_init__(self) -> None:
         self.group_states = tuple(
@@ -413,6 +445,20 @@ class OffloadingConnectorScheduler:
             spec, kv_cache_config
         )
 
+        # Tokens that must remain past a replay boundary for it to be
+        # servable: the last prompt token is always recomputed (hence the
+        # default of 1), and each EAGLE/MTP group must be able to match one
+        # complete chunk past the boundary (its "+1 peek", dropped after
+        # verification in _lookup).
+        self._replay_reserve_tokens: int = max(
+            (
+                group_config.tokens_per_chunk
+                for group_config in self.config.kv_group_configs
+                if group_config.is_eagle_group
+            ),
+            default=1,
+        )
+
         self._req_status: dict[ReqId, RequestOffloadState] = {}
         self._current_batch_load_jobs: dict[int, TransferJob] = {}
         self._current_batch_jobs_to_flush: set[int] = set()
@@ -458,7 +504,10 @@ class OffloadingConnectorScheduler:
         return job_id
 
     def _remove_pending_job(self, job_id: int, block_ids: list[int] | None) -> None:
-        for bid in block_ids or ():
+        # Lockstep MLA groups share physical block IDs, so a transfer job may
+        # contain the same ID once per logical group. The pending-job index is
+        # set-backed and therefore registers each (block, job) pair only once.
+        for bid in set(block_ids or ()):
             pending = self._block_id_to_pending_jobs[bid]
             pending.remove(job_id)
             if not pending:
@@ -474,13 +523,6 @@ class OffloadingConnectorScheduler:
         if self.config.offload_prompt_only:
             num = min(num, req_status.req.num_prompt_tokens)
         return num
-
-    def _maybe_cleanup_finished_req(
-        self, req_id: str, req_status: RequestOffloadState
-    ) -> None:
-        """Clean up req_status if finished and no in-flight jobs."""
-        if req_status.req.is_finished() and not req_status.transfer_jobs:
-            del self._req_status[req_id]
 
     def _maximal_prefix_lookup(
         self, keys: Iterable[OffloadKey], req_context: ReqContext
@@ -943,6 +985,37 @@ class OffloadingConnectorScheduler:
                         ):
                             group_state.block_ids[j] = 0
 
+    def _reachable_tail_end_chunks(
+        self, group_config: GroupOffloadConfig, req: Request, shift: int
+    ) -> tuple[int, ...]:
+        """End chunk indices (exclusive) of serviceable boundary tails.
+
+        Mirrors the replay-boundary handling of
+        SlidingWindowManager.reachable_block_mask: with sparse retention,
+        segment tails exist only once per retention interval. Retain tails at
+        the request replay boundary and at a detected shared-prefix junction.
+        Clamp each boundary to the latest point that every group can service,
+        including a complete EAGLE/MTP peek chunk.
+        """
+        alignment_tokens = self.config.replay_alignment_tokens
+        if alignment_tokens is None:
+            return ()
+
+        latest_serviceable = req.num_prompt_tokens - self._replay_reserve_tokens
+        boundaries = [latest_serviceable]
+        if req.shared_prefix_boundary:
+            boundaries.append(min(req.shared_prefix_boundary, latest_serviceable))
+
+        ends: list[int] = []
+        for boundary in boundaries:
+            aligned = boundary // alignment_tokens * alignment_tokens
+            if aligned <= 0 or aligned % group_config.tokens_per_chunk != 0:
+                continue
+            end = aligned // group_config.tokens_per_chunk + shift
+            if end not in ends:
+                ends.append(end)
+        return tuple(ends)
+
     def _build_store_jobs(
         self,
         scheduler_output: SchedulerOutput,
@@ -995,28 +1068,50 @@ class OffloadingConnectorScheduler:
 
                 alignment_chunk_count = group_config.alignment_chunk_count
                 tail = group_config.sliding_window_size_in_chunks
+                # Chunks reachable by _sliding_window_lookup, mirroring
+                # SlidingWindowManager.reachable_block_mask: a hit needs
+                # `need` contiguous chunks ending at a segment boundary. For
+                # EAGLE/MTP groups the run includes the "+1 peek" chunk and
+                # is shifted one chunk past the boundary, so that after
+                # _lookup drops the peek the hit lands exactly on it.
+                need = shift = 0
+                reachable_end_chunks: tuple[int, ...] = ()
+                if alignment_chunk_count is not None:
+                    assert tail is not None
+                    shift = 1 if group_config.is_eagle_group else 0
+                    need = tail + shift
+                    reachable_end_chunks = self._reachable_tail_end_chunks(
+                        group_config, req, shift
+                    )
 
                 for key_idx, (offload_key, block_id) in enumerate(
                     zip(offload_keys, offload_block_ids)
                 ):
                     if block_id == 0:
                         continue
-                    # Skip SWA chunks that can never serve a load hit:
-                    # within each full-attention alignment segment, only the
-                    # trailing `tail` chunks are reachable by
+                    # Skip SWA chunks that can never serve a load hit: only
+                    # the trailing `need` chunks of each alignment segment
+                    # (plus the replay-boundary tail) are reachable by
                     # _sliding_window_lookup. For DeepSeek V4 with 100K
                     # tokens this reduces SWA stores by ~78%.
                     if alignment_chunk_count is not None:
-                        assert tail is not None
                         abs_chunk_idx = start_chunk_idx + key_idx
-                        pos_in_segment = abs_chunk_idx % alignment_chunk_count
-                        if pos_in_segment < alignment_chunk_count - tail:
+                        reachable = (
+                            abs_chunk_idx >= shift
+                            and (abs_chunk_idx - shift) % alignment_chunk_count
+                            >= alignment_chunk_count - need
+                        )
+                        if not reachable:
+                            reachable = any(
+                                end - need <= abs_chunk_idx < end
+                                for end in reachable_end_chunks
+                            )
+                        if not reachable:
                             continue
                     new_offload_keys.append(offload_key)
 
             if not new_offload_keys:
                 req_status.advance_stored_idx(num_offloadable_tokens)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             store_output = self.manager.prepare_store(
@@ -1027,12 +1122,10 @@ class OffloadingConnectorScheduler:
                     _ConnectorMetricName.ALLOCATION_FAILURE
                 )
                 logger.warning("Request %s: cannot store chunks", req_id)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             if not store_output.keys_to_store:
                 req_status.advance_stored_idx(num_offloadable_tokens)
-                self._maybe_cleanup_finished_req(req_id, req_status)
                 continue
 
             self._touch(req_status)
@@ -1176,6 +1269,17 @@ class OffloadingConnectorScheduler:
             store_jobs=self._build_store_jobs(scheduler_output),
             jobs_to_flush=self._current_batch_jobs_to_flush,
         )
+
+        # prepare_store must remain valid until every final store has been
+        # submitted. Tiering managers may release per-request state here.
+        for req_id in scheduler_output.finished_req_ids or ():
+            req_status = self._req_status.get(req_id)
+            if req_status is None:
+                continue
+            req_status.finished_signaled = True
+            self.manager.on_request_finished(req_status.req_context)
+            if not req_status.transfer_jobs:
+                del self._req_status[req_id]
         self._current_batch_load_jobs = {}
         self._current_batch_jobs_to_flush = set()
         self._current_batch_allocated_block_ids = set()
@@ -1266,7 +1370,7 @@ class OffloadingConnectorScheduler:
 
             del self._jobs[job_id]
             req_status.transfer_jobs.remove(job_id)
-            if not req_status.transfer_jobs and req_status.req.is_finished():
+            if req_status.finished_signaled and not req_status.transfer_jobs:
                 del self._req_status[job_status.req_id]
 
     def get_stats(self) -> OffloadingConnectorStats | None:
@@ -1308,7 +1412,6 @@ class OffloadingConnectorScheduler:
             self.manager.on_request_finished(req_context)
             return False, None
 
-        self.manager.on_request_finished(req_status.req_context)
         self._maybe_observe_lookup_async_delay(req_status)
 
         # Update offload keys with final block hash so _build_store_jobs can
@@ -1352,6 +1455,8 @@ class OffloadingConnectorScheduler:
 
         for req_id, status in list(self._req_status.items()):
             if status.req.is_finished():
+                if not status.finished_signaled:
+                    self.manager.on_request_finished(status.req_context)
                 del self._req_status[req_id]
 
         # Reset offloading manager cache

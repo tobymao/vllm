@@ -303,16 +303,6 @@ _FP8_DTYPE = current_platform.fp8_dtype()
 _B12X_ABSORB_BMM_MAX_M = 32
 
 
-def is_packed_quantized_dtype(dtype: torch.dtype) -> bool:
-    """True if ``dtype`` is a container for packed quantized weights.
-
-    NVFP4 packs into ``uint8``; compressed-tensors int4/int8 packs into
-    ``int32``. Neither is a real activation dtype, so ``kv_c_normed`` must not
-    be cast to them -- the linear layer unpacks and quantizes internally.
-    """
-    return dtype in (torch.uint8, torch.int32)
-
-
 def _run_mla_query_bmm(
     query: torch.Tensor,
     weight: torch.Tensor,
@@ -341,6 +331,22 @@ def _run_mla_query_bmm(
     # Fallback for CPU tests, non-BF16 paths, and builds without the CUDA op.
     # The copy keeps tight DCP/custom-allocation query views out of torch.bmm.
     torch.bmm(query.contiguous() if use_safe_op else query, weight, out=output)
+
+
+def is_packed_quantized_dtype(dtype: torch.dtype) -> bool:
+    """Return whether ``dtype`` is a packed quantized-weight container.
+
+    NVFP4 packs into ``uint8``; compressed-tensors int4/int8 packs into
+    ``int32``. Neither is a real activation dtype, so ``kv_c_normed`` must not
+    be cast to them -- the linear layer unpacks and quantizes internally.
+
+    Args:
+        dtype: Data type to classify.
+
+    Returns:
+        Whether the data type stores packed quantized weights.
+    """
+    return dtype in (torch.uint8, torch.int32)
 
 
 @functools.cache
@@ -3194,7 +3200,7 @@ class MLACommonBaseImpl(MLAAttentionImpl[A], Generic[A]):
             if (
                 use_fp8_prefill or _kv_b_proj_w_dtype != current_platform.fp8_dtype()
             ) and not is_packed_quantized_dtype(_kv_b_proj_w_dtype):
-                kv_c_normed = kv_c_normed.to(self.kv_b_proj.weight.dtype)
+                kv_c_normed = kv_c_normed.to(_kv_b_proj_w_dtype)
 
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(

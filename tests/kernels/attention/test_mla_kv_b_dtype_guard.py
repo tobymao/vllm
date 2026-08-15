@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Packed-quantized kv_b_proj weights must not drive a kv_c_normed upcast.
 
-NVFP4 packs into uint8 and int-quant (compressed-tensors) packs into int32.
+NVFP4 packs into uint8 and compressed-tensors int4/int8 packs into int32.
 Both are containers, not real activation dtypes -- casting kv_c_normed to
-them corrupts chunked prefill past ~4K prompts.
+either corrupts chunked prefill past ~4K prompts.
 """
+
+import pytest
 import torch
 
 from vllm.model_executor.layers.attention.mla_attention import (
@@ -12,21 +15,15 @@ from vllm.model_executor.layers.attention.mla_attention import (
 )
 
 
-def test_uint8_is_packed():
-    assert is_packed_quantized_dtype(torch.uint8)
-
-
-def test_int32_is_packed():
-    assert is_packed_quantized_dtype(torch.int32)
-
-
-def test_bfloat16_is_not_packed():
-    assert not is_packed_quantized_dtype(torch.bfloat16)
-
-
-def test_float16_is_not_packed():
-    assert not is_packed_quantized_dtype(torch.float16)
-
-
-def test_float8_is_not_packed():
-    assert not is_packed_quantized_dtype(torch.float8_e4m3fn)
+@pytest.mark.parametrize(
+    "dtype,expected",
+    [
+        (torch.uint8, True),  # NVFP4
+        (torch.int32, True),  # compressed-tensors int4/int8
+        (torch.bfloat16, False),
+        (torch.float16, False),
+        (torch.float8_e4m3fn, False),
+    ],
+)
+def test_is_packed_quantized_dtype(dtype: torch.dtype, expected: bool):
+    assert is_packed_quantized_dtype(dtype) is expected

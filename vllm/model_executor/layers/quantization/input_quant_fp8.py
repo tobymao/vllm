@@ -16,6 +16,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import (
     DeepGemmQuantScaleFMT,
+    get_tma_aligned_size,
     is_deep_gemm_e8m0_used,
     is_deep_gemm_supported,
 )
@@ -90,12 +91,7 @@ class QuantFP8(CustomOp):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         from vllm.model_executor.layers.quantization.utils import fp8_utils
 
-        if (
-            self.is_group_quant
-            and self.use_ue8m0
-            and self.use_deep_gemm_supported
-            and (DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0)
-        ):
+        if self.is_group_quant and self._deepgemm_wants_packed_scales():
             return fp8_utils.per_token_group_quant_fp8_packed_for_deepgemm(
                 x,
                 group_size=self.group_size,
@@ -190,21 +186,12 @@ class QuantFP8(CustomOp):
     ):
         if self.is_group_quant and not self.static:
             assert scale is None, "Dynamic group quantization does not use scale"
-            # Mirror the forward_cuda branch: when the oracle selects DeepGEMM's
-            # packed UE8M0 scale format, plain float32 scales are the wrong
-            # format entirely, not merely a different layout. Without this the
-            # compiled path silently feeds DeepGEMM unpacked scales -- GLM-5.2
-            # served pure token-0 with compile on and was correct under
-            # --enforce-eager. Producing the packed form here (rather than
-            # forcing the custom op) keeps the quantization fusable by inductor.
-            if self._use_deepgemm_packed_scales():
-                # DeepGEMM always expects packed UE8M0 scales here; falling back
-                # to `_quantize_group_native` would hand it float32 scales, a
-                # different shape and stride entirely. The packed builder below
-                # handles every token count without branching, which matters:
-                # a Python guard on `mn` lives inside the compiled region and
-                # specializes, so a graph traced at an aligned size gets reused
-                # at an unaligned one and emits the wrong stride.
+            # Must mirror forward_cuda's choice exactly. When DeepGEMM wants
+            # packed UE8M0, plain float32 scales are the wrong *format*, not
+            # merely a different layout, and CustomOp.default_on() is False
+            # under inductor -- so this is the path a compiled run takes and
+            # DeepGEMM silently receives unpacked scales.
+            if self._deepgemm_wants_packed_scales():
                 return self._quantize_group_native_packed(x)
             return self._quantize_group_native(x)
 
@@ -246,18 +233,19 @@ class QuantFP8(CustomOp):
 
         return out, scale
 
-    def _use_deepgemm_packed_scales(self) -> bool:
-        """Whether the consumer expects DeepGEMM's packed UE8M0 scale format."""
-        from vllm.utils.deep_gemm import DeepGemmQuantScaleFMT
+    def _deepgemm_wants_packed_scales(self) -> bool:
+        """Whether the consumer expects DeepGEMM's packed UE8M0 scale format.
 
-        if not (self.use_deep_gemm_supported and self.use_ue8m0):
-            return False
-        try:
-            return DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
-        except AssertionError:
-            # Oracle not initialized (e.g. standalone use); fall back to plain
-            # scales rather than guessing at the packed layout.
-            return False
+        Shared by forward_cuda and forward_native so the two cannot disagree
+        about the scale format they emit. The oracle only answers UE8M0 on the
+        SM120 family; elsewhere it answers FLOAT32_CEIL_UE8M0 and both paths
+        return plain float32 scales.
+        """
+        return (
+            self.use_ue8m0
+            and self.use_deep_gemm_supported
+            and DeepGemmQuantScaleFMT.from_oracle() == DeepGemmQuantScaleFMT.UE8M0
+        )
 
     def _quantize_group_native_packed(
         self, x: torch.Tensor
@@ -282,9 +270,7 @@ class QuantFP8(CustomOp):
 
         # UE8M0 keeps only a power-of-two scale, so the exponent is the payload.
         exponent = torch.ceil(torch.log2(absmax / _FP8_MAX))
-        quantized = (xg / torch.exp2(exponent).unsqueeze(-1)).clamp(
-            _FP8_MIN, _FP8_MAX
-        )
+        quantized = (xg / torch.exp2(exponent).unsqueeze(-1)).clamp(_FP8_MIN, _FP8_MAX)
         x_q = quantized.to(_FP8_DTYPE).reshape(x.shape)
 
         # e8m0 byte is the biased exponent; four bytes pack into one int32.
@@ -295,21 +281,19 @@ class QuantFP8(CustomOp):
         b = byte.reshape(mn, k_packed, 4)
         packed = b[..., 0] | (b[..., 1] << 8) | (b[..., 2] << 16) | (b[..., 3] << 24)
 
-        # DeepGEMM asserts sf.stride(-2) == 1, i.e. the mn dim must be the fast
-        # one, with the slow stride padded to align4(mn). Build that by making a
-        # [k_packed, align4(mn)] contiguous tensor and transposing, rather than
-        # via empty_strided+copy_: inductor is free to ignore an empty_strided
-        # layout request and materialize row-major (which trips the assertion),
-        # but it does preserve a transpose-derived view. Slicing the leading dim
-        # afterwards keeps the strides intact.
-        # Required layout: size(-2) == mn, stride(-2) == 1, stride(-1) ==
-        # get_tma_aligned_size(mn). Pad the transposed buffer out to the aligned
-        # size, materialize, transpose back and slice -- verified to satisfy all
-        # three under eager, static compile and dynamic compile, at both aligned
-        # and unaligned token counts (glm/bench/quantfp8_dynamic_shape_repro.py).
-        # A bare transpose-of-contiguous is correct only when mn is already a
-        # multiple of 4 and silently yields stride(-1) == mn otherwise.
-        tma_aligned_mn = ((mn + 3) // 4) * 4
+        # DeepGEMM requires size(-2) == mn, stride(-2) == 1 and
+        # stride(-1) == get_tma_aligned_size(mn): the mn dim must be the fast
+        # one, with the slow stride padded out to the TMA-aligned size.
+        #
+        # Build it by padding the transposed buffer, materializing, transposing
+        # back and slicing -- NOT via empty_strided + copy_. Inductor is free to
+        # ignore an empty_strided layout request and materialize row-major,
+        # which trips the assertion, but it does preserve a transpose-derived
+        # view, and slicing the leading dim afterwards keeps the strides intact.
+        #
+        # A bare transpose-of-contiguous is correct only when mn is already
+        # TMA-aligned and silently yields stride(-1) == mn otherwise.
+        tma_aligned_mn = get_tma_aligned_size(mn, packed.element_size())
         packed_t = F.pad(packed.transpose(0, 1), (0, tma_aligned_mn - mn))
         return x_q, packed_t.contiguous().transpose(0, 1)[:mn]
 

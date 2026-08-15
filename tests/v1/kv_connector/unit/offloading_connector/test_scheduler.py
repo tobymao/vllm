@@ -37,6 +37,10 @@ from vllm.v1.kv_offload.base import (
     get_offload_block_hash,
     make_offload_key,
 )
+from vllm.v1.kv_offload.tiering.manager import (
+    CPUPrimaryTierOffloadingManager,
+    TieringOffloadingManager,
+)
 from vllm.v1.request import RequestStatus
 
 
@@ -53,6 +57,19 @@ def _reduce_kv_connector_stats(runner):
     return reduced
 
 
+def test_remove_pending_job_deduplicates_lockstep_mla_block_ids() -> None:
+    """Clean one shared physical block once per transfer job."""
+    scheduler = object.__new__(OffloadingConnectorScheduler)
+    scheduler._block_id_to_pending_jobs = {
+        7: {42, 43},
+        9: {42},
+    }
+
+    scheduler._remove_pending_job(42, [7, 7, 9, 9])
+
+    assert scheduler._block_id_to_pending_jobs == {7: {43}}
+
+
 def test_scheduler_reports_allocation_failure(request_runner):
     runner = request_runner(
         block_size=4,
@@ -65,7 +82,8 @@ def test_scheduler_reports_allocation_failure(request_runner):
     runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     reduced = _reduce_kv_connector_stats(runner)
-    assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 1
+    # The final scheduler step retries the failed store before finalization.
+    assert reduced[_ConnectorMetricName.ALLOCATION_FAILURE] == 2
 
 
 @pytest.mark.parametrize("missing_metadata", ["block_ids", "offload_keys"])
@@ -166,7 +184,7 @@ def test_abort_queued_request_does_not_build_store_job(
 def test_last_block_offloaded_at_request_finish(
     request_runner, async_scheduling: bool, prompt_offset: int
 ):
-    """EOS fills the last block at request finish — verify req_status is kept alive.
+    """EOS fills the last block at request finish and stores it before cleanup.
 
     prompt = block_size + prompt_offset tokens → not a full block at schedule time,
     so _build_store_jobs creates no store job. After EOS, request_finished
@@ -188,18 +206,49 @@ def test_last_block_offloaded_at_request_finish(
         generate_store_output(list(keys))
     )
 
-    # Run with one step (EOS)
-    runner.run(
-        decoded_tokens=[EOS_TOKEN_ID],
-    )
+    if prompt_offset == -1:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+    else:
+        runner.run(decoded_tokens=[EOS_TOKEN_ID])
 
     cs = runner.connector_scheduler
-    # Verify req_status is kept alive for _build_store_jobs to process
-    # regardless of whether there are storable blocks
-    assert "0" in cs._req_status, (
-        "req_status was deleted but should be kept alive "
-        "for _build_store_jobs to process finished_req_ids."
+    assert "0" not in cs._req_status
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_tiering_manager_final_store_precedes_request_finish(
+    request_runner, async_scheduling: bool
+):
+    """Regression for a final-store KeyError in TieringOffloadingManager."""
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=10,
+        async_scheduling=async_scheduling,
     )
+
+    manager_events: list[str] = []
+    primary = MagicMock(spec=CPUPrimaryTierOffloadingManager)
+    primary.lookup.return_value = LookupResult.MISS
+    primary.get_stats.return_value = None
+    primary.take_events.return_value = []
+
+    def prepare_store(keys, req_context):
+        manager_events.append("prepare_store")
+        return generate_store_output(keys)
+
+    primary.prepare_store.side_effect = prepare_store
+    primary.on_request_finished.side_effect = lambda req_context: manager_events.append(
+        "on_request_finished"
+    )
+
+    tiering_manager = TieringOffloadingManager(primary_tier=primary)
+    runner.connector_scheduler.manager = tiering_manager
+
+    runner.new_request(token_ids=[0, 0, 0])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(0,))
+
+    assert manager_events == ["prepare_store", "on_request_finished"]
+    assert tiering_manager._req_state == {}
 
 
 def test_scheduler_reports_lookup_sync_delay(request_runner):
@@ -423,10 +472,10 @@ def test_request_preemption(request_runner, async_scheduling: bool):
 
 
 @pytest.mark.parametrize("async_scheduling", [True, False])
-def test_on_request_finished_is_not_deferred_until_store_completion(
+def test_on_request_finished_not_deferred_until_store_completion(
     request_runner, async_scheduling: bool
 ):
-    """on_request_finished fires when no more stores will be submitted.
+    """on_request_finished fires after the last prepare_store is submitted.
 
     A request can finish while its GPU->primary store is still in flight. The
     manager-level hook should not wait for that completion; complete_store may
@@ -467,8 +516,8 @@ def test_on_request_finished_is_not_deferred_until_store_completion(
         complete_transfers=False,
     )
 
-    # Finish the request while its stores are still in flight. The hook should
-    # fire immediately even though no complete_store has arrived yet.
+    # The following scheduler step submits the final store and fires the hook,
+    # without waiting for any complete_store callback.
     runner.run(
         decoded_tokens=[EOS_TOKEN_ID],
         complete_transfers=False,
@@ -685,7 +734,7 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
     touch_calls = runner.manager.touch.call_args_list
     assert len(touch_calls) == 6
 
-    runner.run(decoded_tokens=[EOS_TOKEN_ID])
+    runner.run(decoded_tokens=[EOS_TOKEN_ID], expected_stored=(6,))
 
     runner.scheduler.reset_prefix_cache()
 
@@ -698,19 +747,11 @@ def test_two_groups_full_and_sliding_window(request_runner, async_scheduling: bo
         # Group 1 (sliding window, window=2): only the last 2 blocks
         #   are within the window → loads blocks 1,2
         expected_loaded=((0, 0), (0, 1), (0, 2), (1, 1), (1, 2)),
-        # The deferred store from the previous request's last block
-        # completes during this step, and its blocks are flushed because
-        # they were reallocated to the new request.
-        # Only block 1 (sliding window group) is stored — block 0's
-        # deferred store is flushed because it was reallocated.
-        expected_stored=((0, 1),),
-        expected_flushed=((0, 1),),
     )
 
-    # 4 touch calls: 2 from get_num_new_matched_tokens (2 groups)
-    # + 2 from _get_reqs_to_store (2 groups)
+    # 2 touch calls from get_num_new_matched_tokens (2 groups).
     touch_calls = runner.manager.touch.call_args_list
-    assert len(touch_calls) == 4
+    assert len(touch_calls) == 2
     # full attention group touched all 3 blocks
     assert len(touch_calls[0].args[0]) == 3
     # sliding window group touched just the last 2 blocks
@@ -1553,16 +1594,13 @@ def test_reset_cache_finalizes_finished_request_with_pending_store(
     assert req_status.transfer_jobs, "expected an in-flight store before finish"
     assert any(job.is_store for job in cs._jobs.values())
 
-    # Finish the request while its store is still in flight. request_finished
-    # fires the hook eagerly, but the entry stays tracked so later completions
-    # can still call complete_store().
+    # Finalization is deferred because the final store decision has not run.
     req_status.req.status = RequestStatus.FINISHED_STOPPED
     cs.request_finished(req_status.req)
-    assert finalized == [req_id]
+    assert finalized == []
     assert req_id in cs._req_status
 
-    # reset_cache discards the in-flight store and drops the state without a
-    # duplicate on_request_finished call.
+    # reset_cache discards pending work, signals finalization, and drops state.
     cs.reset_cache()
     assert finalized == [req_id]
     assert req_id not in cs._req_status
@@ -1780,6 +1818,288 @@ def test_swa_alignment_skip(request_runner, async_scheduling: bool):
             (1, 6),
             (1, 7),
         ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_skip_eagle(request_runner, async_scheduling: bool):
+    """EAGLE/MTP SWA groups store their per-segment tail run shifted one
+    block past the segment boundary.
+
+    _lookup requires sliding_window_size_in_chunks + 1 consecutive stored
+    blocks for eagle groups (the "+1 peek" block, dropped after matching).
+    Mirroring SlidingWindowManager.reachable_block_mask (shift=1), the store
+    path retains a run of tail + 1 blocks ending one block PAST each segment
+    boundary, so the post-drop hit lands exactly on the boundary.
+
+    Setup:
+      - Group 0: full attention, block_size=16
+      - Group 1: SWA + eagle, block_size=4, sliding_window=8
+
+    alignment_chunk_count = 16 / 4 = 4, tail = 2, need = 3 (incl. peek).
+    Reachable block positions: {2, 3, 4} and {6, 7, 8} (shifted by one).
+
+    With a 36-token prompt (2 full full-attn blocks, 9 SWA blocks):
+      - Group 0 stores: blocks 0, 1
+      - Group 1 stores: blocks 2, 3, 4, 6, 7, 8
+
+    A replay then hits exactly 32 tokens (the second segment boundary): the
+    eagle lookup matches the run [6, 7, 8], drops peek block 8, and the
+    load fetches window blocks [6, 7].
+    """
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+            is_eagle_group=True,
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    kv_group_configs = runner.connector_scheduler.config.kv_group_configs
+    assert kv_group_configs[1].is_eagle_group
+    assert kv_group_configs[1].alignment_chunk_count == 4
+    assert kv_group_configs[1].sliding_window_size_in_chunks == 2
+    # No sparse retention -> no per-request replay tail.
+    assert runner.connector_scheduler.config.replay_alignment_tokens is None
+
+    # Track stored keys so lookups reflect the actual store-side filtering.
+    stored_keys: set = set()
+
+    def _prepare_store(keys, req_context):
+        keys = list(keys)
+        stored_keys.update(keys)
+        return generate_store_output(keys)
+
+    runner.manager.prepare_store.side_effect = _prepare_store
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+
+    num_tokens = 36
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(decoded_tokens=[0])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (1, 6),
+            (1, 7),
+            (1, 8),
+        ),
+    )
+
+    # Replay the same prompt; the eagle group must hit exactly at the
+    # 32-token segment boundary via the shifted run [6, 7, 8].
+    runner.scheduler.reset_prefix_cache()
+    # Avoid re-storing the (unloaded) peek block during the replay.
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (1, 6),
+            (1, 7),
+        ),
+    )
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_swa_alignment_retention_interval(
+    request_runner, monkeypatch, async_scheduling: bool
+):
+    """VLLM_PREFIX_CACHE_RETENTION_INTERVAL sets the sparsity segment size,
+    and a per-request replay-boundary tail keeps exact replays servable.
+
+    Mirrors SlidingWindowManager.reachable_block_mask: with sparse retention
+    the local GPU cache keeps SWA tails once per retention interval (not at
+    every full-attention block boundary), plus one tail run at the latest
+    full-attention-aligned boundary of the prompt (the "replay boundary") so
+    a replay of the same prompt does not fall back a whole retention segment.
+
+    Setup:
+      - retention interval = 32 tokens
+      - Group 0: full attention, block_size=16
+      - Group 1: SWA, block_size=4, sliding_window=8
+
+    alignment_chunk_count = 32 / 4 = 8 (retention-based, not 16 / 4 = 4).
+
+    With a 56-token prompt (3 full full-attn blocks, 14 SWA blocks):
+      - segment tails: blocks {6, 7} (the second segment is incomplete:
+        blocks 14, 15 never fill)
+      - replay boundary: (56 - 1) // 16 * 16 = 48 -> tail run {10, 11}
+      - Group 1 stores: blocks 6, 7, 10, 11
+
+    A replay of the prompt hits 48 tokens via the replay tail {10, 11};
+    without it, the hit would fall back to 32 (the only segment boundary).
+    """
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "32")
+
+    full_attn_block_size = 16
+    swa_block_size = 4
+    sliding_window = 8
+    num_gpu_blocks = 200
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=full_attn_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=swa_block_size,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=sliding_window,
+            ),
+        ),
+    ]
+
+    runner = request_runner(
+        block_size=swa_block_size,
+        num_gpu_blocks=num_gpu_blocks,
+        async_scheduling=async_scheduling,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    config = runner.connector_scheduler.config
+    # Segment granularity comes from the retention interval.
+    assert config.kv_group_configs[1].alignment_chunk_count == 8
+    assert config.kv_group_configs[1].sliding_window_size_in_chunks == 2
+    # Replay tails align to the full-attention block size.
+    assert config.replay_alignment_tokens == full_attn_block_size
+
+    # Track stored keys so lookups reflect the actual store-side filtering.
+    stored_keys: set = set()
+
+    def _prepare_store(keys, req_context):
+        keys = list(keys)
+        stored_keys.update(keys)
+        return generate_store_output(keys)
+
+    runner.manager.prepare_store.side_effect = _prepare_store
+    runner.manager.lookup.side_effect = lambda key, req_context: (
+        LookupResult.HIT if key in stored_keys else LookupResult.MISS
+    )
+
+    num_tokens = 56
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(decoded_tokens=[0])
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_stored=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 6),
+            (1, 7),
+            (1, 10),
+            (1, 11),
+        ),
+    )
+
+    # Replay the same prompt; the hit must reach the 48-token replay
+    # boundary served by the replay tail run {10, 11}.
+    runner.scheduler.reset_prefix_cache()
+    runner.manager.prepare_store.side_effect = lambda keys, req_context: (
+        generate_store_output([])
+    )
+    runner.new_request(token_ids=[0] * num_tokens)
+    runner.run(
+        decoded_tokens=[EOS_TOKEN_ID],
+        expected_loaded=(
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 10),
+            (1, 11),
+        ),
+    )
+
+
+def test_swa_alignment_retains_shared_prefix_boundary(request_runner, monkeypatch):
+    """Native offload retains the same sparse shared-prefix tail as APC."""
+    monkeypatch.setenv("VLLM_PREFIX_CACHE_RETENTION_INTERVAL", "64")
+
+    kv_cache_groups = [
+        KVCacheGroupSpec(
+            ["layer0"],
+            FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+            ),
+        ),
+        KVCacheGroupSpec(
+            ["layer1"],
+            SlidingWindowSpec(
+                block_size=4,
+                num_kv_heads=1,
+                head_size=1,
+                dtype=torch.float32,
+                sliding_window=8,
+            ),
+        ),
+    ]
+    runner = request_runner(
+        block_size=4,
+        num_gpu_blocks=200,
+        async_scheduling=False,
+        kv_cache_groups=kv_cache_groups,
+    )
+
+    runner.new_request(token_ids=[0] * 56)
+    request = runner.scheduler.requests[str(runner.req_id)]
+    request.shared_prefix_boundary = 32
+
+    group_config = runner.connector_scheduler.config.kv_group_configs[1]
+    assert runner.connector_scheduler._reachable_tail_end_chunks(
+        group_config, request, shift=0
+    ) == (
+        12,  # Latest replay boundary: floor((56 - 1) / 16) * 16 / 4.
+        8,  # Shared-prefix junction: 32 / 4.
     )
 
 
