@@ -43,12 +43,21 @@ class Fp8DraftHeadMethod:
     """
 
     def __init__(self, weight_fp8: torch.Tensor, weight_scale: torch.Tensor):
-        self.weight_fp8 = weight_fp8            # [num_embeddings_per_rank, hidden]
-        self.weight_scale = weight_scale        # [num_embeddings_per_rank, 1], fp32
-
-    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
         from vllm import _custom_ops as ops
 
+        self.weight_fp8 = weight_fp8            # [num_embeddings_per_rank, hidden]
+        # Stored pre-transposed to [1, N]: cutlass_scaled_mm broadcasts scale_b against a
+        # [K, N] operand, and reshaping per call would be pure overhead on the decode path.
+        self.weight_scale = weight_scale.reshape(1, -1).contiguous()
+        # Bound once rather than imported per call -- this runs on every drafter step.
+        self._scaled_mm = ops.cutlass_scaled_mm
+
+    def apply(self, layer, x: torch.Tensor, bias: torch.Tensor | None = None):
+        if x.dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                f"FP8 draft head needs a bf16/fp16 hidden state, got {x.dtype}; "
+                "cutlass_scaled_mm cannot emit fp32."
+            )
         flat = x.reshape(-1, x.shape[-1])
         # Per-token activation scale. Decode drafts one token per sequence, so this is a
         # handful of rows -- the quantise is far cheaper than the weight read it enables.
@@ -60,20 +69,57 @@ class Fp8DraftHeadMethod:
         # path, where _scaled_mm's alignment requirements are version-dependent, and the
         # Cutlass op is the same family already serving this deployment's dense layers on
         # SM121. Weight is stored [vocab_rank, hidden]; the op wants [hidden, vocab_rank].
-        out = ops.cutlass_scaled_mm(
+        out = self._scaled_mm(
             x_fp8,
             self.weight_fp8.t(),
             scale_a=x_scale,
-            scale_b=self.weight_scale.reshape(1, -1),
+            scale_b=self.weight_scale,
             out_dtype=x.dtype,
             bias=bias,
         )
         return out.reshape(*x.shape[:-1], out.shape[-1])
 
 
+ROWS_PER_CHUNK = 4096
+
+
+def _quantize_rowwise(wd: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Row-scaled FP8 copy of ``wd``, built in chunks.
+
+    Chunked because the obvious one-liner is not affordable where this matters most. A
+    154,880 x 6,144 bf16 head is 454 MB per rank; promoting it whole to fp32 to divide by
+    the scale would allocate ~908 MB, and the clamp another, i.e. a transient ~2 GB spike on
+    a unified-memory part that can be idling with ~1 GiB free. Chunking caps the spike at
+    ROWS_PER_CHUNK x hidden x 4 bytes (~100 MB) regardless of vocabulary size.
+
+    Per-OUTPUT-ROW scaling, not per-tensor: a handful of high-magnitude vocabulary rows would
+    otherwise set one global scale and crush the resolution of every other token's logit.
+    """
+    out = torch.empty_like(wd, dtype=FP8_DTYPE)
+    scale = torch.empty(wd.shape[0], 1, dtype=torch.float32, device=wd.device)
+    for lo in range(0, wd.shape[0], ROWS_PER_CHUNK):
+        hi = min(lo + ROWS_PER_CHUNK, wd.shape[0])
+        block = wd[lo:hi].to(torch.float32)
+        s = (block.abs().amax(dim=1, keepdim=True) / FP8_MAX).clamp(min=1e-12)
+        out[lo:hi] = (block / s).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
+        scale[lo:hi] = s
+        del block, s
+    return out, scale
+
+
 def quantize_draft_lm_head_fp8(model: torch.nn.Module) -> int:
     """Swap every ParallelLMHead in ``model`` to FP8. Returns bytes freed."""
     from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    # Tied word embeddings share ONE storage between lm_head and embed_tokens. Quantising is
+    # still safe there (we build a separate FP8 tensor and only swap the matmul), but FREEING
+    # the bf16 copy would delete the input embedding and destroy the model. Detect sharing by
+    # storage rather than by reading a config flag, so a model that ties without advertising
+    # it is still handled.
+    shared: dict[int, int] = {}
+    for p in model.parameters():
+        if p is not None and p.device.type != "meta":
+            shared[p.data_ptr()] = shared.get(p.data_ptr(), 0) + 1
 
     freed = 0
     for name, mod in model.named_modules():
@@ -83,25 +129,26 @@ def quantize_draft_lm_head_fp8(model: torch.nn.Module) -> int:
         if w is None or w.dtype not in (torch.bfloat16, torch.float16):
             continue
 
-        # Per-output-row scaling: each vocabulary row gets its own scale, so a few
-        # high-magnitude rows cannot crush the resolution of every other token's logit
-        # the way a single tensor-wide scale would.
         wd = w.data
-        amax = wd.abs().amax(dim=1, keepdim=True).to(torch.float32).clamp(min=1e-8)
-        scale = amax / FP8_MAX
-        w_fp8 = (wd.to(torch.float32) / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8_DTYPE)
-
+        w_fp8, scale = _quantize_rowwise(wd)
         before = wd.numel() * wd.element_size()
         after = w_fp8.numel() * w_fp8.element_size() + scale.numel() * scale.element_size()
-        freed += before - after
-
         mod.quant_method = Fp8DraftHeadMethod(w_fp8, scale)
-        # Drop the bf16 copy, so this FREES memory rather than costing it. Safe because the
-        # head is the draft model's OWN parameter (the MTP loader copies lm_head.weight into
-        # it rather than aliasing the target's), and loading has already finished. Anything
-        # still reading `.weight` after this will fail loudly, which is what we want -- a
-        # silent fallback to the bf16 path would report a speedup that never happened.
-        mod.register_parameter("weight", None)
+
+        tied = shared.get(wd.data_ptr(), 1) > 1
+        if tied:
+            # Keep the bf16 copy: something else (the input embedding) still needs it. The
+            # traffic saving still applies -- that comes from the matmul, not from freeing.
+            logger.info(
+                "Draft lm_head %s is TIED to another parameter: using FP8 for the matmul "
+                "but keeping the bf16 copy (%.0f MB not freed)", name, before / 2**20
+            )
+        else:
+            # Drop the bf16 copy, so this FREES memory rather than costing it. Anything still
+            # reading `.weight` afterwards will fail loudly, which is what we want -- a silent
+            # fallback to the bf16 path would report a speedup that never happened.
+            mod.register_parameter("weight", None)
+            freed += before - after
         del wd, w
         logger.info(
             "Draft lm_head %s requantised to FP8: %.0f MB -> %.0f MB",
