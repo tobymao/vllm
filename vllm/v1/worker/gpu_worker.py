@@ -1329,7 +1329,7 @@ class Worker(WorkerBase):
         return self._finish_step(self.model_runner.sample_tokens(grammar_output))
 
     def _b12x_roce_health_check(self) -> Callable[[], None] | None:
-        """The RoCEnante health check of every active communicator (TP and EP).
+        """The RoCEnante health check of every live communicator of this process.
 
         Returns:
             The check callable, or None when RoCEnante is not in use.

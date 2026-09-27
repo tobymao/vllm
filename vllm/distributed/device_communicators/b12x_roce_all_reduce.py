@@ -58,8 +58,9 @@ logger = init_logger(__name__)
 
 REQUIRED_B12X_ROCE_API_VERSION = 1
 
-# Every initialized communicator of this process (TP and EP groups each own
-# one), for the per-step health check and the stall watchdog.
+# Every initialized communicator of this process (only a TP group builds one),
+# for the per-step health check and the stall watchdog, which then need not
+# know which group owns it.
 LIVE_COMMUNICATORS: weakref.WeakSet[B12xRoceAllReduce] = weakref.WeakSet()
 
 
@@ -282,7 +283,7 @@ class B12xRoceAllReduce:
 
     @property
     def name(self) -> str:
-        """The group's global ranks, which tell the TP and EP runtimes apart."""
+        """The group, named by its global ranks."""
         return "ranks " + "-".join(map(str, self.global_ranks))
 
     @property

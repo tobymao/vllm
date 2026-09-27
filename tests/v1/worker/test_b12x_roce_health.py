@@ -6,7 +6,7 @@ The four-node adapter tests in b12x establish the GPU behaviour; this test
 pins where the worker runs the check relative to the step's device-to-host
 completion: immediately for a synchronous output (or ``None``), and only after
 ``get_output()`` for an asynchronous output; and that it covers every live
-communicator (the TP and the EP group each own a runtime).
+communicator of the process, not one looked up through the TP group.
 """
 
 from unittest.mock import Mock
@@ -94,10 +94,10 @@ def test_no_roce_communicator_means_no_wrapping(monkeypatch):
 
 
 def test_every_live_communicator_is_checked(monkeypatch):
-    tp, ep = Mock(), Mock()
-    ep.check_health.side_effect = RuntimeError("poisoned")
-    worker = _worker_with_communicators(monkeypatch, tp, ep)
+    first, second = Mock(), Mock()
+    second.check_health.side_effect = RuntimeError("poisoned")
+    worker = _worker_with_communicators(monkeypatch, first, second)
     with pytest.raises(RuntimeError, match="poisoned"):
         worker._b12x_roce_guarded(_sync_output())
-    tp.check_health.assert_called_once_with()
-    ep.check_health.assert_called_once_with()
+    first.check_health.assert_called_once_with()
+    second.check_health.assert_called_once_with()
