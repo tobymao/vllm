@@ -77,14 +77,14 @@ def test_a_reply_larger_than_a_ring_chunk_is_not_lost():
             reader.wait_until_ready()
             pairs.append((writer, reader))
         big = b"x" * 200_000
-        sender = threading.Thread(
-            target=lambda: (
-                time.sleep(0.05),
-                pairs[1][0].enqueue((SUCCESS, big)),
-                time.sleep(0.05),
-                pairs[0][0].enqueue((SUCCESS, "small")),
-            )
-        )
+
+        def send() -> None:
+            time.sleep(0.05)
+            pairs[1][0].enqueue((SUCCESS, big))
+            time.sleep(0.05)
+            pairs[0][0].enqueue((SUCCESS, "small"))
+
+        sender = threading.Thread(target=send)
         sender.start()
         replies = _gather_responses(
             [reader for _, reader in pairs], range(2), time.monotonic() + 10, "m"
