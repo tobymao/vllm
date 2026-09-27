@@ -88,7 +88,8 @@ class B12xRoceAllReduce:
         self.device = device
         self.rank = dist.get_rank(group=group)
         self.world_size = dist.get_world_size(group=group)
-        self._runtime = None
+        # b12x.comm.roce.AllReduce and its plan once initialized; b12x is untyped.
+        self._runtime: Any = None
         self._announced = False
         self._announced_gather = False
         self.global_ranks = tuple(
@@ -99,7 +100,7 @@ class B12xRoceAllReduce:
         )
         if len(self.global_ranks) != self.world_size:
             raise ValueError("RoCE global ranks must match the process group")
-        self._plan = None
+        self._plan: Any = None
 
         if device_group is None:
             logger.warning("RoCEnante requires a CUDA process group.")
@@ -118,6 +119,7 @@ class B12xRoceAllReduce:
         if verdict is not None:
             logger.warning("RoCEnante disabled on every rank: %s", verdict)
             return
+        assert limits is not None  # the vote passed, so this rank parsed them
         max_size, max_gather = limits
 
         from b12x.comm import roce
