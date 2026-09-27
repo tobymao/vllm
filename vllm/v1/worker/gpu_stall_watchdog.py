@@ -8,9 +8,12 @@ waiting for the next command, and nothing is logged until the executor's
 timeout tears the engine down along with every worker's evidence. This
 watchdog runs on every rank, so the rank whose GPU stopped reports it itself.
 
-It records a CUDA event after each step the worker enqueues and a daemon
-thread polls the oldest unfinished one (``Event.query`` never blocks). When a
-step has been outstanding for ``VLLM_GPU_STALL_DUMP_SECONDS``, or a RoCEnante
+After each step the worker enqueues, the stream itself writes the step's
+number into a pinned host word (``cuStreamWriteValue32``) once it gets there,
+and a daemon thread compares that word with the steps enqueued. The thread
+makes no CUDA call: a query of an event or stream from another thread while
+the worker captures a CUDA graph invalidates the capture. When a step has
+been outstanding for ``VLLM_GPU_STALL_DUMP_SECONDS``, or a RoCEnante
 wait on this rank timed out, it writes one dump under
 ``$VLLM_CACHE_ROOT/gpu_stall/``: every RoCEnante runtime's host-side protocol
 state, every Python thread's stack, and the kernels the GPU is running, read
@@ -34,6 +37,7 @@ import tempfile
 import threading
 import time
 
+import numpy as np
 import torch
 
 import vllm.envs as envs
@@ -59,6 +63,16 @@ CUDA_GDB_COMMANDS = (
     "detach",
     "quit",
 )
+
+
+def _stream_write_u32(address: int, value: int) -> None:
+    """Enqueue a 32-bit write of ``value`` to ``address`` on the current stream."""
+    from cuda.bindings import driver
+
+    stream = torch.cuda.current_stream().cuda_stream
+    (result,) = driver.cuStreamWriteValue32(stream, address, value, 0)
+    if result != driver.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuStreamWriteValue32 failed: {result}")
 
 
 @contextlib.contextmanager
@@ -96,9 +110,13 @@ class GpuStallWatchdog:
         self._stall_seconds = stall_seconds
         self._dump_dir = os.path.join(envs.VLLM_CACHE_ROOT, "gpu_stall")
         self._lock = threading.Lock()
-        self._pending: collections.deque[tuple[float, torch.cuda.Event]] = (
-            collections.deque()
-        )
+        # (step number, time enqueued) of every step the GPU has not reached.
+        self._pending: collections.deque[tuple[int, float]] = collections.deque()
+        self._next_step = 0
+        # Pinned host word the stream writes each finished step's number into;
+        # allocated on the first mark, from the worker thread.
+        self._done_tensor: torch.Tensor | None = None
+        self._done: np.ndarray | None = None
         # One dump per stall (re-armed once the stall clears) and one per
         # RoCEnante failure (terminal: a poisoned runtime stays poisoned).
         self._stall_reported = False
@@ -118,20 +136,27 @@ class GpuStallWatchdog:
         )
 
     def mark(self) -> None:
-        """Record the point the current stream reaches once this step is done."""
-        event = torch.cuda.Event()
-        event.record()
+        """Have the current stream report this step once it has run."""
+        if self._done is None:
+            self._done_tensor = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            self._done = self._done_tensor.numpy().view(np.uint32)
+        assert self._done_tensor is not None
+        self._next_step += 1
+        _stream_write_u32(self._done_tensor.data_ptr(), self._next_step)
         with self._lock:
-            self._pending.append((time.monotonic(), event))
+            self._pending.append((self._next_step, time.monotonic()))
 
     def _oldest_pending_age(self) -> float | None:
-        """Seconds the oldest unfinished step has been outstanding, if any."""
+        """Seconds the oldest step the GPU has not reached has been outstanding."""
+        if self._done is None:
+            return None
+        done = int(self._done[0])
         with self._lock:
-            while self._pending and self._pending[0][1].query():
+            while self._pending and self._pending[0][0] <= done:
                 self._pending.popleft()
             if not self._pending:
                 return None
-            return time.monotonic() - self._pending[0][0]
+            return time.monotonic() - self._pending[0][1]
 
     def _run(self) -> None:
         while True:
